@@ -3,7 +3,7 @@ import { createBucket, deleteBucket, headBucket, listBuckets } from './s3/bucket
 import { errorToResponse } from './s3/errors'
 import { deleteObject, getObject, headObject, listObjects, putObject } from './s3/objects'
 
-const server = Bun.serve({
+export const server = Bun.serve({
 	port: config.port,
 	routes: {
 		'/': {

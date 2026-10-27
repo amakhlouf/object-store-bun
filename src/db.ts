@@ -23,7 +23,7 @@ db.exec(`
   );
 `)
 
-export type BucketRow = { name: string; created_at: string }
+export type BucketRow = { name: string, created_at: string }
 
 export const buckets = {
 	exists(name: string): boolean {

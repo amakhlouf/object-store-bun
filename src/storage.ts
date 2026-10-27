@@ -5,9 +5,9 @@ import { config } from './config'
 import { S3Error } from './s3/errors'
 
 export function objectPath(dataDir: string, bucket: string, key: string): string {
-	const root = resolve(dataDir)
-	const path = resolve(root, bucket, key)
-	if (!path.startsWith(root + sep) || path === resolve(root, bucket)) {
+	const bucketRoot = resolve(dataDir, bucket)
+	const path = resolve(bucketRoot, key)
+	if (!path.startsWith(bucketRoot + sep) || path === bucketRoot) {
 		throw new S3Error('InvalidArgument', 400, 'Invalid Argument')
 	}
 	return path
