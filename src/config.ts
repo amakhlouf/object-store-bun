@@ -7,6 +7,8 @@ export type Config = {
 	dataDir: string
 	sqlitePath: string
 	maxFileBytes: number
+	accessKeyId: string
+	secretAccessKey: string
 }
 
 export function loadConfig(env: Record<string, string | undefined> = Bun.env): Config {
@@ -20,12 +22,17 @@ export function loadConfig(env: Record<string, string | undefined> = Bun.env): C
 	if (!Number.isSafeInteger(maxFileBytes) || maxFileBytes <= 0) {
 		throw new Error(`MAX_FILE_BYTES must be a positive integer, got "${env.MAX_FILE_BYTES}"`)
 	}
+	if (!env.ACCESS_KEY_ID || !env.SECRET_ACCESS_KEY) {
+		throw new Error('ACCESS_KEY_ID and SECRET_ACCESS_KEY must be set')
+	}
 
 	return {
 		port,
 		dataDir,
 		sqlitePath: env.SQLITE_DB || join(dataDir, 'storage.db'),
 		maxFileBytes,
+		accessKeyId: env.ACCESS_KEY_ID,
+		secretAccessKey: env.SECRET_ACCESS_KEY,
 	}
 }
 

@@ -29,6 +29,9 @@ export async function putObject(req: BunRequest<'/:bucket/*'>): Promise<Response
 }
 
 export function getObject(req: BunRequest<'/:bucket/*'>): Response {
+	// Bucket listing requests can arrive with a trailing slash (GET /bucket/), which the wildcard route catches.
+	if (!objectKey(req)) return listObjects(req)
+
 	const bucket = req.params.bucket
 	const key = objectKey(req)
 	const row = findObjectOrThrow(bucket, key)

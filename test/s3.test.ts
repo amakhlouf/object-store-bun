@@ -2,6 +2,7 @@ import { afterAll, describe, expect, test } from 'bun:test'
 import { rmSync } from 'node:fs'
 import { config } from '../src/config'
 import { server } from '../src/index'
+import { signatureFor } from '../src/s3/auth'
 import { objectPath } from '../src/storage'
 
 // Remove the temp data folder after the run, even if tests failed.
@@ -11,10 +12,50 @@ afterAll(() => {
 	if (dir && !Bun.env.KEEP_TEST_DATA) rmSync(dir, { recursive: true, force: true })
 })
 
-const newBucket = () => `t-${crypto.randomUUID().slice(0, 8)}`
+type Creds = { accessKeyId: string, secretAccessKey: string }
+type SignOptions = { creds?: Creds, amzDate?: string, signPath?: string }
 
-function request(method: string, path: string, init: RequestInit = {}) {
-	return fetch(new URL(path, server.url), { method, ...init })
+const newBucket = () => `t-${crypto.randomUUID().slice(0, 8)}`
+const defaultCreds = (): Creds => ({ accessKeyId: Bun.env.ACCESS_KEY_ID ?? '', secretAccessKey: Bun.env.SECRET_ACCESS_KEY ?? '' })
+const amzDateFor = (time: Date) => time.toISOString().replace(/[:-]|\.\d{3}/g, '')
+
+// Signs like an SDK: host, x-amz-content-sha256, and x-amz-date are signed, with an unsigned payload.
+function authHeaders(method: string, path: string, options: SignOptions): Record<string, string> {
+	const url = new URL(path, server.url)
+	const signPath = new URL(options.signPath ?? path, server.url).pathname
+	const creds = options.creds ?? defaultCreds()
+	const amzDate = options.amzDate ?? amzDateFor(new Date())
+	const date = amzDate.slice(0, 8)
+	const payloadHash = 'UNSIGNED-PAYLOAD'
+	const signed = ['host', 'x-amz-content-sha256', 'x-amz-date']
+	const values: Record<string, string> = { host: url.host, 'x-amz-content-sha256': payloadHash, 'x-amz-date': amzDate }
+
+	const query = [...url.searchParams]
+		.map(([k, v]) => [rfc3986(k), rfc3986(v)] as const)
+		.sort(([ak, av], [bk, bv]) => (ak === bk ? (av < bv ? -1 : av > bv ? 1 : 0) : ak < bk ? -1 : 1))
+		.map(([k, v]) => `${k}=${v}`)
+		.join('&')
+
+	const canonical = [method, signPath, query, signed.map(h => `${h}:${values[h]}\n`).join(''), signed.join(';'), payloadHash].join('\n')
+	const scope = `${date}/us-east-1/s3/aws4_request`
+	const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, new Bun.CryptoHasher('sha256').update(canonical).digest('hex')].join('\n')
+	const signature = signatureFor(creds.secretAccessKey, { accessKeyId: creds.accessKeyId, date, region: 'us-east-1', service: 's3' }, stringToSign)
+
+	return {
+		authorization: `AWS4-HMAC-SHA256 Credential=${creds.accessKeyId}/${scope}, SignedHeaders=${signed.join(';')}, Signature=${signature}`,
+		'x-amz-date': amzDate,
+		'x-amz-content-sha256': payloadHash,
+	}
+}
+
+function rfc3986(value: string): string {
+	return encodeURIComponent(value).replace(/[!'()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)
+}
+
+function request(method: string, path: string, init: RequestInit = {}, options: SignOptions = {}) {
+	const headers = new Headers(init.headers)
+	for (const [name, value] of Object.entries(authHeaders(method, path, options))) headers.set(name, value)
+	return fetch(new URL(path, server.url), { ...init, method, headers })
 }
 
 function code(xml: string) {
@@ -24,6 +65,55 @@ function code(xml: string) {
 function keys(xml: string) {
 	return [...xml.matchAll(/<Key>(.*?)<\/Key>/g)].map(m => m[1] ?? '')
 }
+
+describe('auth', () => {
+	test('matches the AWS documented SigV4 example', () => {
+		const stringToSign = [
+			'AWS4-HMAC-SHA256',
+			'20130524T000000Z',
+			'20130524/us-east-1/s3/aws4_request',
+			'7344ae5b7ee6c3e7e6b0fe0640412a37625d1fbfff95c48bbb2dc43964946972',
+		].join('\n')
+		const signature = signatureFor(
+			'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+			{ accessKeyId: 'AKIAIOSFODNN7EXAMPLE', date: '20130524', region: 'us-east-1', service: 's3' },
+			stringToSign,
+		)
+		expect(signature).toBe('f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41')
+	})
+
+	test('a request with no authorization header is denied', async () => {
+		const res = await fetch(new URL('/', server.url))
+		expect(res.status).toBe(403)
+		expect(code(await res.text())).toBe('AccessDenied')
+	})
+
+	test('a wrong secret returns SignatureDoesNotMatch', async () => {
+		const res = await request('GET', '/', {}, { creds: { ...defaultCreds(), secretAccessKey: 'wrong' } })
+		expect(res.status).toBe(403)
+		expect(code(await res.text())).toBe('SignatureDoesNotMatch')
+	})
+
+	test('an unknown access key ID returns InvalidAccessKeyId', async () => {
+		const res = await request('GET', '/', {}, { creds: { ...defaultCreds(), accessKeyId: 'NOPE' } })
+		expect(res.status).toBe(403)
+		expect(code(await res.text())).toBe('InvalidAccessKeyId')
+	})
+
+	test('a timestamp more than 15 minutes old returns RequestTimeTooSkewed', async () => {
+		const old = amzDateFor(new Date(Date.now() - 16 * 60 * 1000))
+		const res = await request('GET', '/', {}, { amzDate: old })
+		expect(res.status).toBe(403)
+		expect(code(await res.text())).toBe('RequestTimeTooSkewed')
+	})
+
+	test('a signature made for one path does not work for another', async () => {
+		const name = newBucket()
+		const res = await request('PUT', `/${name}`, {}, { signPath: `/${newBucket()}` })
+		expect(res.status).toBe(403)
+		expect(code(await res.text())).toBe('SignatureDoesNotMatch')
+	})
+})
 
 describe('buckets', () => {
 	test('create, head, and list', async () => {
@@ -173,6 +263,16 @@ describe('list objects', () => {
 		} while (token)
 
 		expect(seen).toEqual(all)
+	})
+
+	test('a trailing slash lists the bucket', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		await request('PUT', `/${name}/a.txt`, { body: 'x' })
+
+		const res = await request('GET', `/${name}/`)
+		expect(res.status).toBe(200)
+		expect(keys(await res.text())).toEqual(['a.txt'])
 	})
 
 	test('listing a missing bucket returns NoSuchBucket', async () => {
