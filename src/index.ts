@@ -1,7 +1,7 @@
 import { config } from './config'
 import { createBucket, deleteBucket, headBucket, listBuckets } from './s3/buckets'
 import { errorToResponse } from './s3/errors'
-import { deleteObject, getObject, headObject, putObject } from './s3/objects'
+import { deleteObject, getObject, headObject, listObjects, putObject } from './s3/objects'
 
 const server = Bun.serve({
 	port: config.port,
@@ -10,6 +10,7 @@ const server = Bun.serve({
 			GET: listBuckets,
 		},
 		'/:bucket': {
+			GET: listObjects,
 			PUT: createBucket,
 			HEAD: headBucket,
 			DELETE: deleteBucket,

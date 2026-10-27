@@ -75,4 +75,17 @@ export const objects = {
 	remove(bucket: string, key: string): void {
 		db.query('DELETE FROM objects WHERE bucket = ? AND key = ?').run(bucket, key)
 	},
+
+	// Keys in the bucket that start with prefix and sort after `after`, in key order.
+	// Pass '' for after to start from the beginning.
+	list(bucket: string, prefix: string, after: string, limit: number): ObjectRow[] {
+		return db
+			.query<ObjectRow, [string, string, string, string, number]>(
+				`SELECT * FROM objects
+				WHERE bucket = ? AND key > ? AND substr(key, 1, length(?)) = ?
+				ORDER BY key
+				LIMIT ?`,
+			)
+			.all(bucket, after, prefix, prefix, limit)
+	},
 }
