@@ -49,3 +49,30 @@ export const buckets = {
 		return row?.n ?? 0
 	},
 }
+
+export type ObjectRow = {
+	bucket: string
+	key: string
+	size: number
+	etag: string
+	content_type: string
+	last_modified: string
+}
+
+export const objects = {
+	get(bucket: string, key: string): ObjectRow | null {
+		return db
+			.query<ObjectRow, [string, string]>('SELECT * FROM objects WHERE bucket = ? AND key = ?')
+			.get(bucket, key)
+	},
+
+	upsert(row: ObjectRow): void {
+		db.query(
+			'INSERT OR REPLACE INTO objects (bucket, key, size, etag, content_type, last_modified) VALUES (?, ?, ?, ?, ?, ?)',
+		).run(row.bucket, row.key, row.size, row.etag, row.content_type, row.last_modified)
+	},
+
+	remove(bucket: string, key: string): void {
+		db.query('DELETE FROM objects WHERE bucket = ? AND key = ?').run(bucket, key)
+	},
+}
