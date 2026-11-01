@@ -3,7 +3,7 @@ import { rmSync } from 'node:fs'
 import { config } from '../src/config'
 import { server } from '../src/index'
 import { signatureFor } from '../src/s3/auth'
-import { objectPath } from '../src/storage'
+import { objectPath, writeObject } from '../src/storage'
 
 // Remove the temp data folder after the run, even if tests failed.
 // Set KEEP_TEST_DATA=1 to keep it for inspection.
@@ -224,6 +224,23 @@ describe('objects', () => {
 		})
 		expect(res.status).toBe(400)
 		expect(code(await res.text())).toBe('EntityTooLarge')
+	})
+
+	test('a failed overwrite keeps the old object', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		await request('PUT', `/${name}/a.txt`, { body: 'v1' })
+
+		const broken = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode('partial'))
+				controller.error(new Error('upload broke'))
+			},
+		})
+		await expect(writeObject(objectPath(config.dataDir, name, 'a.txt'), broken)).rejects.toThrow('upload broke')
+
+		const get = await request('GET', `/${name}/a.txt`)
+		expect(await get.text()).toBe('v1')
 	})
 
 	test('keys that escape the bucket folder are rejected', () => {

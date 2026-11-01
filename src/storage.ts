@@ -1,5 +1,5 @@
 import type { BunFile } from 'bun'
-import { mkdir, rm } from 'node:fs/promises'
+import { mkdir, rename, rm } from 'node:fs/promises'
 import { dirname, resolve, sep } from 'node:path'
 import { config } from './config'
 import { S3Error } from './s3/errors'
@@ -16,8 +16,10 @@ export function objectPath(dataDir: string, bucket: string, key: string): string
 export async function writeObject(path: string, body: ReadableStream<Uint8Array> | null): Promise<{ etag: string, size: number }> {
 	await mkdir(dirname(path), { recursive: true })
 
+	// Write to a temp file first, so a failed upload never touches the object already at this path.
+	const temp = `${path}.${crypto.randomUUID()}.tmp`
 	const hasher = new Bun.CryptoHasher('md5')
-	const writer = Bun.file(path).writer()
+	const writer = Bun.file(temp).writer()
 	let size = 0
 
 	try {
@@ -31,13 +33,15 @@ export async function writeObject(path: string, body: ReadableStream<Uint8Array>
 				await writer.write(chunk)
 			}
 		}
+		await writer.end()
 	} catch (error) {
 		await writer.end()
-		await rm(path, { force: true })
+		await rm(temp, { force: true })
 		throw error
 	}
 
-	await writer.end()
+	// rename replaces the old file in one step, so readers see either the old object or the new one.
+	await rename(temp, path)
 	return { etag: hasher.digest('hex'), size }
 }
 
