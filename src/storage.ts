@@ -14,12 +14,14 @@ export function objectPath(bucketsDir: string, bucket: string, key: string): str
 	return path
 }
 
-export async function writeObject(path: string, body: ReadableStream<Uint8Array> | null): Promise<{ etag: string, size: number }> {
+// expectedSha256 is the hash the client signed in x-amz-content-sha256. When given, the body must match it.
+export async function writeObject(path: string, body: ReadableStream<Uint8Array> | null, expectedSha256?: string): Promise<{ etag: string, size: number }> {
 	await mkdir(dirname(path), { recursive: true })
 
 	// Write to a temp file first, so a failed upload never touches the object already at this path.
 	const temp = `${path}.${crypto.randomUUID()}.tmp`
 	const hasher = new Bun.CryptoHasher('md5')
+	const payloadHasher = expectedSha256 ? new Bun.CryptoHasher('sha256') : undefined
 	const writer = Bun.file(temp).writer()
 	let size = 0
 
@@ -31,8 +33,12 @@ export async function writeObject(path: string, body: ReadableStream<Uint8Array>
 					throw new S3Error('EntityTooLarge', 400, 'Your proposed upload exceeds the maximum allowed object size.')
 				}
 				hasher.update(chunk)
+				payloadHasher?.update(chunk)
 				await writer.write(chunk)
 			}
+		}
+		if (payloadHasher && payloadHasher.digest('hex') !== expectedSha256?.toLowerCase()) {
+			throw new S3Error('XAmzContentSHA256Mismatch', 400, "The provided 'x-amz-content-sha256' header does not match what was computed.")
 		}
 		await writer.end()
 	} catch (error) {

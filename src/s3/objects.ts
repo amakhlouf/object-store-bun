@@ -17,7 +17,7 @@ export async function putObject(req: BunRequest<'/:bucket/*'>): Promise<Response
 		throw new S3Error('EntityTooLarge', 400, 'Your proposed upload exceeds the maximum allowed object size.', `/${bucket}/${key}`)
 	}
 
-	const { etag, size } = await writeObject(objectPath(config.bucketsDir, bucket, key), req.body)
+	const { etag, size } = await writeObject(objectPath(config.bucketsDir, bucket, key), req.body, signedPayloadHash(req))
 	objects.upsert({
 		bucket,
 		key,
@@ -28,6 +28,12 @@ export async function putObject(req: BunRequest<'/:bucket/*'>): Promise<Response
 	})
 
 	return new Response(null, { status: 200, headers: { ETag: `"${etag}"` } })
+}
+
+// The body hash the client signed. UNSIGNED-PAYLOAD (and presigned requests) has no hash to check against.
+function signedPayloadHash(req: Request): string | undefined {
+	const value = req.headers.get('x-amz-content-sha256') ?? ''
+	return /^[0-9a-f]{64}$/i.test(value) ? value : undefined
 }
 
 // PUT with an x-amz-copy-source header copies an existing object. The request has no body.

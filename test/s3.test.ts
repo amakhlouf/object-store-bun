@@ -17,7 +17,7 @@ afterAll(() => {
 })
 
 type Creds = { accessKeyId: string, secretAccessKey: string }
-type SignOptions = { creds?: Creds, amzDate?: string, signPath?: string }
+type SignOptions = { creds?: Creds, amzDate?: string, signPath?: string, payloadHash?: string }
 
 const newBucket = () => `t-${crypto.randomUUID().slice(0, 8)}`
 const defaultCreds = (): Creds => ({ accessKeyId: Bun.env.ACCESS_KEY_ID ?? '', secretAccessKey: Bun.env.SECRET_ACCESS_KEY ?? '' })
@@ -30,7 +30,7 @@ function authHeaders(method: string, path: string, options: SignOptions): Record
 	const creds = options.creds ?? defaultCreds()
 	const amzDate = options.amzDate ?? amzDateFor(new Date())
 	const date = amzDate.slice(0, 8)
-	const payloadHash = 'UNSIGNED-PAYLOAD'
+	const payloadHash = options.payloadHash ?? 'UNSIGNED-PAYLOAD'
 	const signed = ['host', 'x-amz-content-sha256', 'x-amz-date']
 	const values: Record<string, string> = { host: url.host, 'x-amz-content-sha256': payloadHash, 'x-amz-date': amzDate }
 
@@ -344,6 +344,27 @@ describe('objects', () => {
 		const head = await request('HEAD', `/${name}/2026/a.txt`)
 		expect(head.status).toBe(200)
 		expect(head.headers.get('content-length')).toBe('5')
+	})
+
+	test('a body that matches the signed x-amz-content-sha256 is stored', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		const sha256 = new Bun.CryptoHasher('sha256').update('hello').digest('hex')
+
+		const put = await request('PUT', `/${name}/signed.txt`, { body: 'hello' }, { payloadHash: sha256 })
+		expect(put.status).toBe(200)
+		expect(await (await request('GET', `/${name}/signed.txt`)).text()).toBe('hello')
+	})
+
+	test('a body that does not match the signed x-amz-content-sha256 is rejected and not stored', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		const claimed = new Bun.CryptoHasher('sha256').update('the bytes the client signed').digest('hex')
+
+		const put = await request('PUT', `/${name}/tampered.txt`, { body: 'swapped bytes' }, { payloadHash: claimed })
+		expect(put.status).toBe(400)
+		expect(await put.text()).toContain('XAmzContentSHA256Mismatch')
+		expect((await request('GET', `/${name}/tampered.txt`)).status).toBe(404)
 	})
 
 	test('get a missing key returns NoSuchKey', async () => {
