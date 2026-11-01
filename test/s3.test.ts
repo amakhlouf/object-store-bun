@@ -361,6 +361,47 @@ describe('objects', () => {
 	})
 })
 
+describe('range requests', () => {
+	test('a byte range returns 206 with the requested bytes', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		await request('PUT', `/${name}/a.txt`, { body: 'hello world' })
+
+		const range = await request('GET', `/${name}/a.txt`, { headers: { Range: 'bytes=0-4' } })
+		expect(range.status).toBe(206)
+		expect(range.headers.get('content-range')).toBe('bytes 0-4/11')
+		expect(range.headers.get('content-length')).toBe('5')
+		expect(await range.text()).toBe('hello')
+
+		const open = await request('GET', `/${name}/a.txt`, { headers: { Range: 'bytes=6-' } })
+		expect(await open.text()).toBe('world')
+
+		const suffix = await request('GET', `/${name}/a.txt`, { headers: { Range: 'bytes=-5' } })
+		expect(await suffix.text()).toBe('world')
+	})
+
+	test('a range past the end returns 416', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		await request('PUT', `/${name}/a.txt`, { body: 'hello' })
+
+		const res = await request('GET', `/${name}/a.txt`, { headers: { Range: 'bytes=20-30' } })
+		expect(res.status).toBe(416)
+		expect(res.headers.get('content-range')).toBe('bytes */5')
+	})
+
+	test('without a range the whole object is returned and ranges are advertised', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		await request('PUT', `/${name}/a.txt`, { body: 'hello' })
+
+		const res = await request('GET', `/${name}/a.txt`)
+		expect(res.status).toBe(200)
+		expect(res.headers.get('accept-ranges')).toBe('bytes')
+		expect(await res.text()).toBe('hello')
+	})
+})
+
 describe('copy object', () => {
 	test('copies bytes and content type to a new key, with the same etag', async () => {
 		const name = newBucket()

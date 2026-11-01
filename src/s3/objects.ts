@@ -152,6 +152,7 @@ function objectHeaders(row: ObjectRow): Record<string, string> {
 		'Content-Length': String(row.size),
 		ETag: `"${row.etag}"`,
 		'Last-Modified': new Date(row.last_modified).toUTCString(),
+		'Accept-Ranges': 'bytes',
 	}
 }
 
