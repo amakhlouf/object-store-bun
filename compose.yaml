@@ -7,8 +7,11 @@ services:
     environment:
       ACCESS_KEY_ID: ${ACCESS_KEY_ID:?set ACCESS_KEY_ID in .env}
       SECRET_ACCESS_KEY: ${SECRET_ACCESS_KEY:?set SECRET_ACCESS_KEY in .env}
+      # Backups go to a folder on the host, outside the data volume, so they survive losing the volume.
+      BACKUP_DIR: /backups
     volumes:
       - storage-data:/data
+      - ./backups:/backups
     networks:
       - attachments
 

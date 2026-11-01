@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, spyOn, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join, resolve, sep } from 'node:path'
 import { Database } from 'bun:sqlite'
@@ -215,6 +215,12 @@ describe('backup', () => {
 	test('the default backup folder is outside DATA_DIR', () => {
 		const backups = resolve(config.backupDir)
 		expect(backups.startsWith(resolve(config.dataDir) + sep)).toBe(false)
+	})
+
+	test('refuses a backup folder inside DATA_DIR and writes nothing', () => {
+		const inside = join(config.dataDir, 'nested-backup')
+		expect(() => backup(inside)).toThrow('inside DATA_DIR')
+		expect(existsSync(inside)).toBe(false)
 	})
 
 	test('a backup has the object files and a readable database copy', async () => {
