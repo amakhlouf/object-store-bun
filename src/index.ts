@@ -1,6 +1,7 @@
 import { config } from './config'
 import { checkAuth } from './s3/auth'
 import { createBucket, deleteBucket, headBucket, listBuckets } from './s3/buckets'
+import { health } from './health'
 import { errorToResponse } from './s3/errors'
 import { deleteObject, getObject, headObject, listObjects, putObject } from './s3/objects'
 
@@ -15,6 +16,9 @@ function authed<R extends Request>(handler: (req: R) => Response | Promise<Respo
 export const server = Bun.serve({
 	port: config.port,
 	routes: {
+		'/health': {
+			GET: health,
+		},
 		'/': {
 			GET: authed(listBuckets),
 		},

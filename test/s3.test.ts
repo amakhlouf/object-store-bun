@@ -115,6 +115,14 @@ describe('auth', () => {
 	})
 })
 
+describe('health', () => {
+	test('GET /health returns 200 without a signature', async () => {
+		const res = await fetch(new URL('/health', server.url))
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ status: 'ok' })
+	})
+})
+
 describe('buckets', () => {
 	test('create, head, and list', async () => {
 		const name = newBucket()
