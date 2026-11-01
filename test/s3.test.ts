@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, spyOn, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join, resolve, sep } from 'node:path'
 import { Database } from 'bun:sqlite'
@@ -252,6 +252,22 @@ describe('logging', () => {
 		await fetch(new URL('/health?marker=file', server.url))
 		const written = readFileSync(join(config.logDir, 'server.log'), 'utf8')
 		expect(written).toMatch(/GET \/health 200 \d+(\.\d+)?ms\n$/)
+	})
+
+	test('a failed log file write does not fail the request', async () => {
+		const logPath = join(config.logDir, 'server.log')
+		const saved = join(config.logDir, 'server.log.saved')
+		renameSync(logPath, saved)
+		mkdirSync(logPath)
+		const spy = spyOn(console, 'error').mockImplementation(() => {})
+		try {
+			const res = await fetch(new URL('/health', server.url))
+			expect(res.status).toBe(200)
+		} finally {
+			spy.mockRestore()
+			rmSync(logPath, { recursive: true, force: true })
+			renameSync(saved, logPath)
+		}
 	})
 })
 
