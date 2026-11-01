@@ -1,0 +1,21 @@
+# Runs the storage server on a private network. No ports are published to the host,
+# so only containers attached to the "attachments" network can reach it.
+services:
+  storage:
+    build: .
+    restart: unless-stopped
+    environment:
+      ACCESS_KEY_ID: ${ACCESS_KEY_ID:?set ACCESS_KEY_ID in .env}
+      SECRET_ACCESS_KEY: ${SECRET_ACCESS_KEY:?set SECRET_ACCESS_KEY in .env}
+    volumes:
+      - storage-data:/data
+    networks:
+      - attachments
+
+networks:
+  attachments:
+    # internal: true blocks traffic to the outside internet from this network.
+    internal: true
+
+volumes:
+  storage-data:
