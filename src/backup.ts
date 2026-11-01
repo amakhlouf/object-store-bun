@@ -23,7 +23,7 @@ export function backup(destDir: string): void {
 
 if (import.meta.main) {
 	const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-	const dest = resolve(Bun.env.BACKUP_DIR ?? join('backups', stamp))
+	const dest = resolve(Bun.env.BACKUP_DIR || join('backups', stamp))
 	backup(dest)
 	console.log(`backup written to ${dest}`)
 }
