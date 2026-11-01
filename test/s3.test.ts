@@ -293,6 +293,32 @@ describe('objects', () => {
 	})
 })
 
+describe('copy object', () => {
+	test('copies bytes and content type to a new key, with the same etag', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		await request('PUT', `/${name}/a.txt`, { body: 'hello', headers: { 'Content-Type': 'text/plain' } })
+		const md5 = new Bun.CryptoHasher('md5').update('hello').digest('hex')
+
+		const res = await request('PUT', `/${name}/copies/b.txt`, { headers: { 'x-amz-copy-source': `/${name}/a.txt` } })
+		expect(res.status).toBe(200)
+		expect(await res.text()).toContain(`<ETag>"${md5}"</ETag>`)
+
+		const get = await request('GET', `/${name}/copies/b.txt`)
+		expect(await get.text()).toBe('hello')
+		expect(get.headers.get('content-type')).toBe('text/plain')
+	})
+
+	test('copying a missing source returns NoSuchKey', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+
+		const res = await request('PUT', `/${name}/b.txt`, { headers: { 'x-amz-copy-source': `/${name}/nope.txt` } })
+		expect(res.status).toBe(404)
+		expect(code(await res.text())).toBe('NoSuchKey')
+	})
+})
+
 describe('list objects', () => {
 	test('prefix and delimiter group keys into common prefixes', async () => {
 		const name = newBucket()

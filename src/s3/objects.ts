@@ -6,6 +6,8 @@ import { S3Error } from './errors'
 import { xmlResponse } from './responses'
 
 export async function putObject(req: BunRequest<'/:bucket/*'>): Promise<Response> {
+	if (req.headers.has('x-amz-copy-source')) return copyObject(req)
+
 	const bucket = req.params.bucket
 	const key = objectKey(req)
 	assertBucketExists(bucket)
@@ -26,6 +28,36 @@ export async function putObject(req: BunRequest<'/:bucket/*'>): Promise<Response
 	})
 
 	return new Response(null, { status: 200, headers: { ETag: `"${etag}"` } })
+}
+
+// PUT with an x-amz-copy-source header copies an existing object. The request has no body.
+async function copyObject(req: BunRequest<'/:bucket/*'>): Promise<Response> {
+	const bucket = req.params.bucket
+	const key = objectKey(req)
+	assertBucketExists(bucket)
+
+	const source = parseCopySource(req.headers.get('x-amz-copy-source') ?? '')
+	assertBucketExists(source.bucket)
+	const row = findObjectOrThrow(source.bucket, source.key)
+
+	const { etag, size } = await writeObject(
+		objectPath(config.dataDir, bucket, key),
+		readObject(objectPath(config.dataDir, source.bucket, source.key)).stream(),
+	)
+	const lastModified = new Date().toISOString()
+	objects.upsert({ bucket, key, size, etag, content_type: row.content_type, last_modified: lastModified })
+
+	return xmlResponse({ CopyObjectResult: { LastModified: lastModified, ETag: `"${etag}"` } })
+}
+
+// The header is "/bucket/key" or "bucket/key", URL-encoded.
+function parseCopySource(header: string): { bucket: string, key: string } {
+	const path = decodeURIComponent(header).replace(/^\//, '')
+	const slash = path.indexOf('/')
+	if (slash <= 0 || slash === path.length - 1) {
+		throw new S3Error('InvalidArgument', 400, 'Invalid copy source object key.')
+	}
+	return { bucket: path.slice(0, slash), key: path.slice(slash + 1) }
 }
 
 export function getObject(req: BunRequest<'/:bucket/*'>): Response {
