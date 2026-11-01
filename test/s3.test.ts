@@ -1,5 +1,9 @@
 import { afterAll, describe, expect, spyOn, test } from 'bun:test'
-import { rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { basename, join } from 'node:path'
+import { Database } from 'bun:sqlite'
+import { backup } from '../src/backup'
 import { config } from '../src/config'
 import { server } from '../src/index'
 import { signatureFor } from '../src/s3/auth'
@@ -120,6 +124,26 @@ describe('health', () => {
 		const res = await fetch(new URL('/health', server.url))
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual({ status: 'ok' })
+	})
+})
+
+describe('backup', () => {
+	test('a backup has the object files and a readable database copy', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		await request('PUT', `/${name}/a.txt`, { body: 'kept' })
+
+		const dest = mkdtempSync(join(tmpdir(), 's3-backup-'))
+		try {
+			backup(join(dest, 'copy'))
+
+			expect(readFileSync(join(dest, 'copy', name, 'a.txt'), 'utf8')).toBe('kept')
+			const copy = new Database(join(dest, 'copy', basename(config.sqlitePath)), { readonly: true })
+			expect(copy.query('SELECT key FROM objects WHERE bucket = ?').all(name)).toEqual([{ key: 'a.txt' }])
+			copy.close()
+		} finally {
+			rmSync(dest, { recursive: true, force: true })
+		}
 	})
 })
 
