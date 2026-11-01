@@ -9,7 +9,7 @@ RUN bun install --frozen-lockfile --production
 COPY src ./src
 
 # Data and logs live in a volume at /data. The image's non-root "bun" user must own it.
-# LOG_DIR must sit inside the volume: ./logs would resolve to /app/logs, which bun cannot create.
+# LOG_DIR is set explicitly so the log folder is visibly inside the volume (the default is DATA_DIR/logs anyway).
 ENV PORT=3000 \
 	DATA_DIR=/data \
 	LOG_DIR=/data/logs

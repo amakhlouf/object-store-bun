@@ -17,7 +17,7 @@ export async function putObject(req: BunRequest<'/:bucket/*'>): Promise<Response
 		throw new S3Error('EntityTooLarge', 400, 'Your proposed upload exceeds the maximum allowed object size.', `/${bucket}/${key}`)
 	}
 
-	const { etag, size } = await writeObject(objectPath(config.dataDir, bucket, key), req.body)
+	const { etag, size } = await writeObject(objectPath(config.bucketsDir, bucket, key), req.body)
 	objects.upsert({
 		bucket,
 		key,
@@ -41,8 +41,8 @@ async function copyObject(req: BunRequest<'/:bucket/*'>): Promise<Response> {
 	const row = findObjectOrThrow(source.bucket, source.key)
 
 	const { etag, size } = await writeObject(
-		objectPath(config.dataDir, bucket, key),
-		readObject(objectPath(config.dataDir, source.bucket, source.key)).stream(),
+		objectPath(config.bucketsDir, bucket, key),
+		readObject(objectPath(config.bucketsDir, source.bucket, source.key)).stream(),
 	)
 	const lastModified = new Date().toISOString()
 	objects.upsert({ bucket, key, size, etag, content_type: row.content_type, last_modified: lastModified })
@@ -68,7 +68,7 @@ export function getObject(req: BunRequest<'/:bucket/*'>): Response {
 	const key = objectKey(req)
 	const row = findObjectOrThrow(bucket, key)
 
-	return new Response(readObject(objectPath(config.dataDir, bucket, key)), {
+	return new Response(readObject(objectPath(config.bucketsDir, bucket, key)), {
 		headers: objectHeaders(row),
 	})
 }
@@ -84,7 +84,7 @@ export async function deleteObject(req: BunRequest<'/:bucket/*'>): Promise<Respo
 	assertBucketExists(bucket)
 
 	objects.remove(bucket, key)
-	await deleteObjectFile(objectPath(config.dataDir, bucket, key))
+	await deleteObjectFile(objectPath(config.bucketsDir, bucket, key))
 
 	return new Response(null, { status: 204 })
 }

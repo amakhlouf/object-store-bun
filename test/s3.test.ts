@@ -1,10 +1,10 @@
 import { afterAll, describe, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, join, resolve, sep } from 'node:path'
 import { Database } from 'bun:sqlite'
 import { backup } from '../src/backup'
-import { config } from '../src/config'
+import { config, loadConfig } from '../src/config'
 import { server } from '../src/index'
 import { signatureFor } from '../src/s3/auth'
 import { objectPath, writeObject } from '../src/storage'
@@ -143,6 +143,22 @@ describe('auth', () => {
 	})
 })
 
+describe('path defaults', () => {
+	test('everything except backups defaults to a folder under DATA_DIR', () => {
+		const c = loadConfig({ DATA_DIR: '/srv/store', ACCESS_KEY_ID: 'a', SECRET_ACCESS_KEY: 'b' })
+		expect(c.sqlitePath).toBe('/srv/store/storage.db')
+		expect(c.logDir).toBe('/srv/store/logs')
+		expect(c.bucketsDir).toBe('/srv/store/buckets')
+		expect(c.backupDir).toBe('./backups')
+	})
+
+	test('LOG_DIR and BACKUP_DIR override their defaults', () => {
+		const c = loadConfig({ DATA_DIR: '/srv/store', LOG_DIR: '/var/log/s3', BACKUP_DIR: '/mnt/b', ACCESS_KEY_ID: 'a', SECRET_ACCESS_KEY: 'b' })
+		expect(c.logDir).toBe('/var/log/s3')
+		expect(c.backupDir).toBe('/mnt/b')
+	})
+})
+
 describe('health', () => {
 	test('GET /health returns 200 without a signature', async () => {
 		const res = await fetch(new URL('/health', server.url))
@@ -196,6 +212,11 @@ describe('presigned URLs', () => {
 })
 
 describe('backup', () => {
+	test('the default backup folder is outside DATA_DIR', () => {
+		const backups = resolve(config.backupDir)
+		expect(backups.startsWith(resolve(config.dataDir) + sep)).toBe(false)
+	})
+
 	test('a backup has the object files and a readable database copy', async () => {
 		const name = newBucket()
 		await request('PUT', `/${name}`)
@@ -205,7 +226,7 @@ describe('backup', () => {
 		try {
 			backup(join(dest, 'copy'))
 
-			expect(readFileSync(join(dest, 'copy', name, 'a.txt'), 'utf8')).toBe('kept')
+			expect(readFileSync(join(dest, 'copy', 'buckets', name, 'a.txt'), 'utf8')).toBe('kept')
 			const copy = new Database(join(dest, 'copy', basename(config.sqlitePath)), { readonly: true })
 			expect(copy.query('SELECT key FROM objects WHERE bucket = ?').all(name)).toEqual([{ key: 'a.txt' }])
 			copy.close()
@@ -356,10 +377,27 @@ describe('objects', () => {
 				controller.error(new Error('upload broke'))
 			},
 		})
-		await expect(writeObject(objectPath(config.dataDir, name, 'a.txt'), broken)).rejects.toThrow('upload broke')
+		await expect(writeObject(objectPath(config.bucketsDir, name, 'a.txt'), broken)).rejects.toThrow('upload broke')
 
 		const get = await request('GET', `/${name}/a.txt`)
 		expect(await get.text()).toBe('v1')
+	})
+
+	test('object files live under DATA_DIR/buckets/<bucket>/', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		await request('PUT', `/${name}/a.txt`, { body: 'x' })
+
+		expect(readFileSync(join(config.bucketsDir, name, 'a.txt'), 'utf8')).toBe('x')
+	})
+
+	test('a bucket named like a server file does not overwrite it', async () => {
+		await request('PUT', '/logs')
+		await request('PUT', '/logs/server.log', { body: 'object bytes' })
+
+		const log = readFileSync(join(config.logDir, 'server.log'), 'utf8')
+		expect(log.startsWith('object bytes')).toBe(false)
+		expect(log).toContain('PUT /logs/server.log')
 	})
 
 	test('keys that escape the bucket folder are rejected', () => {

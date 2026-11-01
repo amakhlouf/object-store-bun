@@ -4,8 +4,9 @@ import { dirname, resolve, sep } from 'node:path'
 import { config } from './config'
 import { S3Error } from './s3/errors'
 
-export function objectPath(dataDir: string, bucket: string, key: string): string {
-	const bucketRoot = resolve(dataDir, bucket)
+// Buckets live in their own folder, so a bucket name can't collide with storage.db or logs/.
+export function objectPath(bucketsDir: string, bucket: string, key: string): string {
+	const bucketRoot = resolve(bucketsDir, bucket)
 	const path = resolve(bucketRoot, key)
 	if (!path.startsWith(bucketRoot + sep) || path === bucketRoot) {
 		throw new S3Error('InvalidArgument', 400, 'Invalid Argument')
