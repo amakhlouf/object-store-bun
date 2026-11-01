@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from 'bun:test'
+import { afterAll, describe, expect, spyOn, test } from 'bun:test'
 import { rmSync } from 'node:fs'
 import { config } from '../src/config'
 import { server } from '../src/index'
@@ -120,6 +120,19 @@ describe('health', () => {
 		const res = await fetch(new URL('/health', server.url))
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual({ status: 'ok' })
+	})
+})
+
+describe('logging', () => {
+	test('each request logs method, path, status, and time, without the query string', async () => {
+		const lines: string[] = []
+		const spy = spyOn(console, 'log').mockImplementation((line: string) => lines.push(String(line)))
+		try {
+			await fetch(new URL('/health?secret=1', server.url))
+		} finally {
+			spy.mockRestore()
+		}
+		expect(lines).toContainEqual(expect.stringMatching(/^GET \/health 200 \d+(\.\d+)?ms$/))
 	})
 })
 
