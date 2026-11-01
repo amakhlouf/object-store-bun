@@ -39,3 +39,5 @@ data/*
 # backups
 backups
 
+# logs
+logs

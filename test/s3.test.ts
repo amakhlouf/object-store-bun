@@ -226,6 +226,12 @@ describe('logging', () => {
 		}
 		expect(lines).toContainEqual(expect.stringMatching(/^GET \/health 200 \d+(\.\d+)?ms$/))
 	})
+
+	test('each request line is also appended to LOG_DIR/server.log', async () => {
+		await fetch(new URL('/health?marker=file', server.url))
+		const written = readFileSync(join(config.logDir, 'server.log'), 'utf8')
+		expect(written).toMatch(/GET \/health 200 \d+(\.\d+)?ms\n$/)
+	})
 })
 
 describe('buckets', () => {

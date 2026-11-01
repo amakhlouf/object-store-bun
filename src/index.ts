@@ -1,7 +1,8 @@
 import { config } from './config'
+import { health } from './health'
+import { log } from './log'
 import { checkAuth } from './s3/auth'
 import { createBucket, deleteBucket, headBucket, listBuckets } from './s3/buckets'
-import { health } from './health'
 import { errorToResponse } from './s3/errors'
 import { deleteObject, getObject, headObject, listObjects, putObject } from './s3/objects'
 
@@ -25,7 +26,7 @@ function logged<R extends Request>(handler: (req: R) => Response | Promise<Respo
 			res = errorToResponse(error)
 		}
 		const path = new URL(req.url).pathname
-		console.log(`${req.method} ${path} ${res.status} ${(performance.now() - started).toFixed(1)}ms`)
+		log(`${req.method} ${path} ${res.status} ${(performance.now() - started).toFixed(1)}ms`)
 		return res
 	}
 }

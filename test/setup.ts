@@ -13,3 +13,4 @@ Bun.env.ACCESS_KEY_ID = 'AKTEST00000000000001'
 Bun.env.SECRET_ACCESS_KEY = 'testsecret0000000000000000000000000000'
 
 Bun.env.TEST_DATA_DIR = dataDir
+Bun.env.LOG_DIR = join(dataDir, 'logs')

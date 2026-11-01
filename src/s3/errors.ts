@@ -1,3 +1,4 @@
+import { log } from '../log'
 import { xmlResponse } from './responses'
 
 export class S3Error extends Error {
@@ -17,7 +18,7 @@ export function errorToResponse(error: unknown): Response {
 	if (error instanceof S3Error) {
 		s3 = error
 	} else {
-		console.error(error)
+		log(`ERROR ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`)
 		s3 = new S3Error('InternalError', 500, 'We encountered an internal error. Please try again.')
 	}
 

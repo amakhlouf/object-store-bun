@@ -7,6 +7,7 @@ export type Config = {
 	dataDir: string
 	sqlitePath: string
 	maxFileBytes: number
+	logDir: string
 	accessKeyId: string
 	secretAccessKey: string
 }
@@ -31,6 +32,7 @@ export function loadConfig(env: Record<string, string | undefined> = Bun.env): C
 		dataDir,
 		sqlitePath: env.SQLITE_DB || join(dataDir, 'storage.db'),
 		maxFileBytes,
+		logDir: env.LOG_DIR || './logs',
 		accessKeyId: env.ACCESS_KEY_ID,
 		secretAccessKey: env.SECRET_ACCESS_KEY,
 	}
