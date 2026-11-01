@@ -187,7 +187,7 @@ The database is the index. Listings and existence checks read it. Object bytes a
 | CopyObject         | `PUT /:bucket/*` + copy header | Done        |
 | Multipart upload   | `POST /:bucket/*`              | Not yet     |
 
-Every route requires a valid signature. Errors use the S3 XML error format, with codes such as `AccessDenied`, `SignatureDoesNotMatch`, `NoSuchBucket`, `NoSuchKey`, `BucketNotEmpty`, and `EntityTooLarge`.
+Every route except `GET /health` requires a valid signature. Errors use the S3 XML error format, with codes such as `AccessDenied`, `SignatureDoesNotMatch`, `NoSuchBucket`, `NoSuchKey`, `BucketNotEmpty`, and `EntityTooLarge`.
 
 ## Limits
 
