@@ -3,10 +3,27 @@ import { S3Error } from './errors'
 
 const ALGORITHM = 'AWS4-HMAC-SHA256'
 const MAX_SKEW_MS = 15 * 60 * 1000
+const MAX_PRESIGN_SECONDS = 7 * 24 * 60 * 60
 
 export type Credential = { accessKeyId: string, date: string, region: string, service: string }
 
+type Signed = {
+	credential: Credential
+	signedHeaders: string[]
+	signature: string
+	amzDate: string
+	payloadHash: string
+	// Set for presigned URLs: how many seconds after amzDate the link stays valid.
+	expires?: number
+}
+
 export function checkAuth(req: Request): void {
+	const url = new URL(req.url)
+	if (url.searchParams.has('X-Amz-Signature')) {
+		checkPresigned(req, url)
+		return
+	}
+
 	if (req.headers.get('x-amz-content-sha256')?.startsWith('STREAMING-')) {
 		throw new S3Error('NotImplemented', 501, 'Chunked signed uploads are not supported yet.')
 	}
@@ -15,28 +32,70 @@ export function checkAuth(req: Request): void {
 	if (!header) throw new S3Error('AccessDenied', 403, 'Access Denied')
 
 	const { credential, signedHeaders, signature } = parseAuthorization(header)
+	verify(req, {
+		credential,
+		signedHeaders,
+		signature,
+		amzDate: req.headers.get('x-amz-date') ?? '',
+		payloadHash: req.headers.get('x-amz-content-sha256') ?? '',
+	})
+}
+
+// A presigned URL carries its signature in the query string and signs UNSIGNED-PAYLOAD,
+// so whoever holds the link can act without the keys, until it expires.
+function checkPresigned(req: Request, url: URL): void {
+	const params = url.searchParams
+	if (params.get('X-Amz-Algorithm') !== ALGORITHM) {
+		throw new S3Error('AuthorizationQueryParametersError', 400, 'X-Amz-Algorithm only supports AWS4-HMAC-SHA256.')
+	}
+	const expires = Number(params.get('X-Amz-Expires'))
+	if (!Number.isInteger(expires) || expires < 1 || expires > MAX_PRESIGN_SECONDS) {
+		throw new S3Error('AuthorizationQueryParametersError', 400, 'X-Amz-Expires must be between 1 and 604800 seconds.')
+	}
+
+	verify(req, {
+		credential: parseCredential(params.get('X-Amz-Credential') ?? ''),
+		signedHeaders: parseSignedHeaders(params.get('X-Amz-SignedHeaders') ?? ''),
+		signature: params.get('X-Amz-Signature') ?? '',
+		amzDate: params.get('X-Amz-Date') ?? '',
+		payloadHash: 'UNSIGNED-PAYLOAD',
+		expires,
+	})
+}
+
+function verify(req: Request, signed: Signed): void {
+	const { credential, signedHeaders, signature, amzDate, payloadHash, expires } = signed
 	if (credential.accessKeyId !== config.accessKeyId) {
 		throw new S3Error('InvalidAccessKeyId', 403, 'The AWS access key ID you provided does not exist in our records.')
 	}
-
-	const amzDate = req.headers.get('x-amz-date') ?? ''
 	if (credential.date !== amzDate.slice(0, 8)) {
 		throw new S3Error('AuthorizationHeaderMalformed', 400, 'The authorization header you provided is invalid.')
 	}
-	if (Math.abs(Date.now() - parseAmzDate(amzDate)) > MAX_SKEW_MS) {
-		throw new S3Error('RequestTimeTooSkewed', 403, `The difference between the request time and the server's time is too large.`)
-	}
-
-	const payloadHash = req.headers.get('x-amz-content-sha256') ?? ''
+	checkTiming(amzDate, expires)
 	if (!payloadHash) {
 		throw new S3Error('InvalidRequest', 400, 'Missing required header for this request: x-amz-content-sha256.')
 	}
 
 	const scope = `${credential.date}/${credential.region}/${credential.service}/aws4_request`
-	const stringToSign = [ALGORITHM, amzDate, scope, sha256Hex(canonicalRequest(req, signedHeaders, payloadHash))].join('\n')
+	const omitQuery = expires === undefined ? undefined : 'X-Amz-Signature'
+	const stringToSign = [ALGORITHM, amzDate, scope, sha256Hex(canonicalRequest(req, signedHeaders, payloadHash, omitQuery))].join('\n')
 	const expected = signatureFor(config.secretAccessKey, credential, stringToSign)
 	if (!safeEqual(expected, signature)) {
 		throw new S3Error('SignatureDoesNotMatch', 403, 'The request signature we calculated does not match the signature you provided. Check your AWS secret access key and signing method.')
+	}
+}
+
+// Header requests must be close to the server's clock. Presigned URLs are valid for their stated window instead.
+function checkTiming(amzDate: string, expires?: number): void {
+	const signedAt = parseAmzDate(amzDate)
+	if (expires === undefined) {
+		if (Math.abs(Date.now() - signedAt) > MAX_SKEW_MS) {
+			throw new S3Error('RequestTimeTooSkewed', 403, `The difference between the request time and the server's time is too large.`)
+		}
+		return
+	}
+	if (Date.now() > signedAt + expires * 1000) {
+		throw new S3Error('AccessDenied', 403, 'Request has expired')
 	}
 }
 
@@ -60,26 +119,40 @@ function parseAuthorization(header: string) {
 			.split(', ')
 			.map(part => part.split('=', 2) as [string, string]),
 	)
-	const credentialParts = (fields.get('Credential') ?? '').split('/')
-	const signedHeaders = (fields.get('SignedHeaders') ?? '').split(';').filter(Boolean)
 	const signature = fields.get('Signature') ?? ''
-
-	const [accessKeyId, date, region, service, terminator] = credentialParts
-	if (!accessKeyId || !date || !region || service !== 's3' || terminator !== 'aws4_request' || !signedHeaders.length || !signature) {
+	if (!signature) {
 		throw new S3Error('AuthorizationHeaderMalformed', 400, 'The authorization header you provided is invalid.')
 	}
 
 	return {
-		credential: { accessKeyId, date, region, service } as Credential,
-		signedHeaders: signedHeaders.map(h => h.toLowerCase()).sort(),
+		credential: parseCredential(fields.get('Credential') ?? ''),
+		signedHeaders: parseSignedHeaders(fields.get('SignedHeaders') ?? ''),
 		signature,
 	}
 }
 
-function canonicalRequest(req: Request, signedHeaders: string[], payloadHash: string): string {
+// Credential is "accessKeyId/date/region/s3/aws4_request".
+function parseCredential(value: string): Credential {
+	const [accessKeyId, date, region, service, terminator] = value.split('/')
+	if (!accessKeyId || !date || !region || service !== 's3' || terminator !== 'aws4_request') {
+		throw new S3Error('AuthorizationHeaderMalformed', 400, 'The authorization header you provided is invalid.')
+	}
+	return { accessKeyId, date, region, service }
+}
+
+function parseSignedHeaders(value: string): string[] {
+	const headers = value.split(';').filter(Boolean)
+	if (!headers.length) {
+		throw new S3Error('AuthorizationHeaderMalformed', 400, 'The authorization header you provided is invalid.')
+	}
+	return headers.map(h => h.toLowerCase()).sort()
+}
+
+function canonicalRequest(req: Request, signedHeaders: string[], payloadHash: string, omitQuery?: string): string {
 	const url = new URL(req.url)
 
 	const query = [...url.searchParams]
+		.filter(([k]) => k !== omitQuery)
 		.map(([k, v]) => [rfc3986(k), rfc3986(v)] as const)
 		.sort(([ak, av], [bk, bv]) => (ak === bk ? compare(av, bv) : compare(ak, bk)))
 		.map(([k, v]) => `${k}=${v}`)

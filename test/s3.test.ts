@@ -62,6 +62,30 @@ function request(method: string, path: string, init: RequestInit = {}, options: 
 	return fetch(new URL(path, server.url), { ...init, method, headers })
 }
 
+// Builds a presigned URL the way an SDK does: the signature goes in the query string and the payload is UNSIGNED-PAYLOAD.
+function presignedUrl(method: string, path: string, options: { expires?: number, amzDate?: string } = {}): URL {
+	const url = new URL(path, server.url)
+	const creds = defaultCreds()
+	const amzDate = options.amzDate ?? amzDateFor(new Date())
+	const scope = `${amzDate.slice(0, 8)}/us-east-1/s3/aws4_request`
+	url.searchParams.set('X-Amz-Algorithm', 'AWS4-HMAC-SHA256')
+	url.searchParams.set('X-Amz-Credential', `${creds.accessKeyId}/${scope}`)
+	url.searchParams.set('X-Amz-Date', amzDate)
+	url.searchParams.set('X-Amz-Expires', String(options.expires ?? 300))
+	url.searchParams.set('X-Amz-SignedHeaders', 'host')
+
+	const query = [...url.searchParams]
+		.map(([k, v]) => [rfc3986(k), rfc3986(v)] as const)
+		.sort(([ak, av], [bk, bv]) => (ak === bk ? (av < bv ? -1 : av > bv ? 1 : 0) : ak < bk ? -1 : 1))
+		.map(([k, v]) => `${k}=${v}`)
+		.join('&')
+	const canonical = [method, url.pathname, query, `host:${url.host}\n`, 'host', 'UNSIGNED-PAYLOAD'].join('\n')
+	const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, new Bun.CryptoHasher('sha256').update(canonical).digest('hex')].join('\n')
+	const signature = signatureFor(creds.secretAccessKey, { accessKeyId: creds.accessKeyId, date: amzDate.slice(0, 8), region: 'us-east-1', service: 's3' }, stringToSign)
+	url.searchParams.set('X-Amz-Signature', signature)
+	return url
+}
+
 function code(xml: string) {
 	return xml.match(/<Code>(.*?)<\/Code>/)?.[1]
 }
@@ -124,6 +148,50 @@ describe('health', () => {
 		const res = await fetch(new URL('/health', server.url))
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual({ status: 'ok' })
+	})
+})
+
+describe('presigned URLs', () => {
+	test('a presigned GET works without an authorization header', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		await request('PUT', `/${name}/a.txt`, { body: 'shared' })
+
+		const res = await fetch(presignedUrl('GET', `/${name}/a.txt`))
+		expect(res.status).toBe(200)
+		expect(await res.text()).toBe('shared')
+	})
+
+	test('an expired presigned URL is denied', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		const twoHoursAgo = amzDateFor(new Date(Date.now() - 2 * 60 * 60 * 1000))
+
+		const res = await fetch(presignedUrl('GET', `/${name}`, { expires: 60, amzDate: twoHoursAgo }))
+		const body = await res.text()
+		expect(res.status).toBe(403)
+		expect(code(body)).toBe('AccessDenied')
+		expect(body).toContain('Request has expired')
+	})
+
+	test('a presigned URL for GET cannot be used with PUT', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+
+		const res = await fetch(presignedUrl('GET', `/${name}/a.txt`), { method: 'PUT', body: 'x' })
+		expect(res.status).toBe(403)
+		expect(code(await res.text())).toBe('SignatureDoesNotMatch')
+	})
+
+	test('a changed presigned URL is denied', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		const url = presignedUrl('GET', `/${name}/a.txt`)
+		url.searchParams.set('X-Amz-Expires', '600')
+
+		const res = await fetch(url)
+		expect(res.status).toBe(403)
+		expect(code(await res.text())).toBe('SignatureDoesNotMatch')
 	})
 })
 
