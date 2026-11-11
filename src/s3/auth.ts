@@ -17,6 +17,36 @@ type Signed = {
 	expires?: number
 }
 
+// How an aws-chunked upload is signed, from the x-amz-content-sha256 header.
+export type StreamingMode = 'signed' | 'signed-trailer' | 'unsigned-trailer'
+
+const STREAMING_MODES: Record<string, StreamingMode> = {
+	'STREAMING-AWS4-HMAC-SHA256-PAYLOAD': 'signed',
+	'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER': 'signed-trailer',
+	'STREAMING-UNSIGNED-PAYLOAD-TRAILER': 'unsigned-trailer',
+}
+
+// What the body decoder needs to check each chunk: the request's own signature starts the chain.
+export type StreamingContext = {
+	mode: StreamingMode
+	credential: Credential
+	amzDate: string
+	seedSignature: string
+}
+
+// Filled by checkAuth, read by the handler that decodes the body. Entries go away with the request.
+const streaming = new WeakMap<Request, StreamingContext>()
+
+export function streamingContext(req: Request): StreamingContext | undefined {
+	return streaming.get(req)
+}
+
+// True when a header-signed request signed UNSIGNED-PAYLOAD, so its body is not covered by the signature.
+// Presigned URLs always do this, because the link is made before the body exists, so they are not counted.
+export function hasUnsignedHeaderPayload(req: Request): boolean {
+	return req.headers.get('x-amz-content-sha256') === 'UNSIGNED-PAYLOAD' && !new URL(req.url).searchParams.has('X-Amz-Signature')
+}
+
 export function checkAuth(req: Request): void {
 	const url = new URL(req.url)
 	if (url.searchParams.has('X-Amz-Signature')) {
@@ -24,21 +54,20 @@ export function checkAuth(req: Request): void {
 		return
 	}
 
-	if (req.headers.get('x-amz-content-sha256')?.startsWith('STREAMING-')) {
-		throw new S3Error('NotImplemented', 501, 'Chunked signed uploads are not supported yet.')
+	const payloadHash = req.headers.get('x-amz-content-sha256') ?? ''
+	const mode = STREAMING_MODES[payloadHash]
+	if (payloadHash.startsWith('STREAMING-') && !mode) {
+		throw new S3Error('NotImplemented', 501, 'This streaming payload type is not supported.')
 	}
 
 	const header = req.headers.get('authorization')
 	if (!header) throw new S3Error('AccessDenied', 403, 'Access Denied')
 
 	const { credential, signedHeaders, signature } = parseAuthorization(header)
-	verify(req, {
-		credential,
-		signedHeaders,
-		signature,
-		amzDate: req.headers.get('x-amz-date') ?? '',
-		payloadHash: req.headers.get('x-amz-content-sha256') ?? '',
-	})
+	const amzDate = req.headers.get('x-amz-date') ?? ''
+	verify(req, { credential, signedHeaders, signature, amzDate, payloadHash })
+
+	if (mode) streaming.set(req, { mode, credential, amzDate, seedSignature: signature })
 }
 
 // A presigned URL carries its signature in the query string and signs UNSIGNED-PAYLOAD,
@@ -181,7 +210,7 @@ function compare(a: string, b: string): number {
 	return a < b ? -1 : a > b ? 1 : 0
 }
 
-function sha256Hex(data: string): string {
+export function sha256Hex(data: string | Uint8Array): string {
 	return new Bun.CryptoHasher('sha256').update(data).digest('hex')
 }
 
@@ -190,7 +219,7 @@ function hmac(key: string | Uint8Array, data: string): Uint8Array {
 }
 
 // Constant-time comparison, so the time taken doesn't reveal how much of the signature matched.
-function safeEqual(a: string, b: string): boolean {
+export function safeEqual(a: string, b: string): boolean {
 	const left = new TextEncoder().encode(a)
 	const right = new TextEncoder().encode(b)
 	if (left.length !== right.length) return false

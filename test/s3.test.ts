@@ -7,6 +7,7 @@ import { backup } from '../src/backup'
 import { config, loadConfig } from '../src/config'
 import { server } from '../src/index'
 import { signatureFor } from '../src/s3/auth'
+import { checksumFor } from '../src/s3/chunked'
 import { objectPath, writeObject } from '../src/storage'
 
 // Remove the temp data folder after the run, even if tests failed.
@@ -56,9 +57,13 @@ function rfc3986(value: string): string {
 	return encodeURIComponent(value).replace(/[!'()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)
 }
 
+// A body is signed with its real SHA-256, like an SDK does. Requests without a body sign UNSIGNED-PAYLOAD.
 function request(method: string, path: string, init: RequestInit = {}, options: SignOptions = {}) {
 	const headers = new Headers(init.headers)
-	for (const [name, value] of Object.entries(authHeaders(method, path, options))) headers.set(name, value)
+	const body = init.body
+	const payloadHash = options.payloadHash
+		?? (typeof body === 'string' || body instanceof Uint8Array ? new Bun.CryptoHasher('sha256').update(body).digest('hex') : undefined)
+	for (const [name, value] of Object.entries(authHeaders(method, path, { ...options, payloadHash }))) headers.set(name, value)
 	return fetch(new URL(path, server.url), { ...init, method, headers })
 }
 
@@ -386,6 +391,29 @@ describe('objects', () => {
 		expect((await request('GET', `/${name}/tampered.txt`)).status).toBe(404)
 	})
 
+	test('a header-signed upload that signs UNSIGNED-PAYLOAD is rejected and not stored', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+
+		const put = await request('PUT', `/${name}/unsigned.txt`, { body: 'x' }, { payloadHash: 'UNSIGNED-PAYLOAD' })
+		expect(put.status).toBe(400)
+		expect(code(await put.text())).toBe('InvalidRequest')
+		expect((await request('GET', `/${name}/unsigned.txt`)).status).toBe(404)
+	})
+
+	test('a presigned PUT is still accepted, even with an UNSIGNED-PAYLOAD header', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+
+		const put = await fetch(presignedUrl('PUT', `/${name}/link.txt`), {
+			method: 'PUT',
+			body: 'via link',
+			headers: { 'x-amz-content-sha256': 'UNSIGNED-PAYLOAD' },
+		})
+		expect(put.status).toBe(200)
+		expect(await (await request('GET', `/${name}/link.txt`)).text()).toBe('via link')
+	})
+
 	test('get a missing key returns NoSuchKey', async () => {
 		const name = newBucket()
 		await request('PUT', `/${name}`)
@@ -458,6 +486,217 @@ describe('objects', () => {
 
 	test('keys that escape the bucket folder are rejected', () => {
 		expect(() => objectPath('/data', 'photos', '../secret')).toThrow('Invalid Argument')
+	})
+})
+
+describe('aws-chunked uploads', () => {
+	type Mode = 'signed' | 'signed-trailer' | 'unsigned-trailer'
+	const PAYLOAD_HASH: Record<Mode, string> = {
+		'signed': 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+		'signed-trailer': 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER',
+		'unsigned-trailer': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
+	}
+	type Upload = {
+		mode: Mode
+		chunks: string[]
+		// Trailing checksum to send. A value overrides the real one, to test a mismatch.
+		checksum?: { algorithm: 'crc32' | 'sha256', value?: string }
+		// null leaves the x-amz-decoded-content-length header out.
+		decodedLength?: number | null
+		// Change the first chunk's bytes after signing it.
+		tamper?: boolean
+		// Cut the body short, in the middle of the last chunk header.
+		truncate?: boolean
+	}
+
+	const hash = (algorithm: string, data: string, encoding: 'hex' | 'base64' = 'hex') =>
+		new Bun.CryptoHasher(algorithm as 'md5' | 'sha256').update(data).digest(encoding)
+
+	function realChecksum(algorithm: 'crc32' | 'sha256', data: string): string {
+		if (algorithm === 'sha256') return hash('sha256', data, 'base64')
+		const out = Buffer.alloc(4)
+		out.writeUInt32BE(Bun.hash.crc32(data))
+		return out.toString('base64')
+	}
+
+	// Signs and sends an aws-chunked PUT the way an SDK does: the request signature starts the chunk signature chain.
+	async function putChunked(path: string, upload: Upload): Promise<Response> {
+		const amzDate = amzDateFor(new Date())
+		const headers = authHeaders('PUT', path, { payloadHash: PAYLOAD_HASH[upload.mode], amzDate })
+		const seed = /Signature=([0-9a-f]{64})/.exec(headers.authorization!)![1]!
+		const creds = defaultCreds()
+		const date = amzDate.slice(0, 8)
+		const scope = `${date}/us-east-1/s3/aws4_request`
+		const sign = (stringToSign: string) =>
+			signatureFor(creds.secretAccessKey, { accessKeyId: creds.accessKeyId, date, region: 'us-east-1', service: 's3' }, stringToSign)
+		const signed = upload.mode !== 'unsigned-trailer'
+		const data = upload.chunks.join('')
+
+		let previous = seed
+		let body = ''
+		for (const chunk of [...upload.chunks, '']) {
+			const size = chunk.length.toString(16)
+			if (signed) {
+				previous = sign(['AWS4-HMAC-SHA256-PAYLOAD', amzDate, scope, previous, hash('sha256', ''), hash('sha256', chunk)].join('\n'))
+				body += `${size};chunk-signature=${previous}\r\n`
+			} else {
+				body += `${size}\r\n`
+			}
+			if (chunk) body += `${chunk}\r\n`
+		}
+
+		let trailerName = ''
+		if (upload.mode === 'signed') {
+			body += '\r\n'
+		} else {
+			let canonical = ''
+			if (upload.checksum) {
+				trailerName = `x-amz-checksum-${upload.checksum.algorithm}`
+				const value = upload.checksum.value ?? realChecksum(upload.checksum.algorithm, data)
+				canonical = `${trailerName}:${value}\n`
+				body += `${trailerName}:${value}\r\n`
+			}
+			if (signed) body += `x-amz-trailer-signature:${sign(['AWS4-HMAC-SHA256-TRAILER', amzDate, scope, previous, hash('sha256', canonical)].join('\n'))}\r\n`
+			body += '\r\n'
+		}
+
+		if (upload.tamper) body = body.replace(upload.chunks[0]!, upload.chunks[0]!.toUpperCase())
+		if (upload.truncate) body = body.slice(0, body.indexOf('\r\n0;') + 12)
+
+		const decoded = upload.decodedLength === undefined ? String(data.length) : upload.decodedLength === null ? undefined : String(upload.decodedLength)
+		return fetch(new URL(path, server.url), {
+			method: 'PUT',
+			headers: {
+				...headers,
+				'content-encoding': 'aws-chunked',
+				...(decoded === undefined ? {} : { 'x-amz-decoded-content-length': decoded }),
+				...(trailerName ? { 'x-amz-trailer': trailerName } : {}),
+			},
+			body,
+		})
+	}
+
+	async function newUploadBucket(): Promise<string> {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		return name
+	}
+
+	async function expectNotStored(bucket: string, key: string) {
+		expect((await request('GET', `/${bucket}/${key}`)).status).toBe(404)
+	}
+
+	test('signed chunks are decoded and stored', async () => {
+		const bucket = await newUploadBucket()
+		const put = await putChunked(`/${bucket}/a.txt`, { mode: 'signed', chunks: ['hello ', 'world', '!'] })
+		expect(put.status).toBe(200)
+		expect(put.headers.get('etag')).toBe(`"${hash('md5', 'hello world!')}"`)
+		expect(await (await request('GET', `/${bucket}/a.txt`)).text()).toBe('hello world!')
+	})
+
+	test('chunks larger than a network read are decoded', async () => {
+		const bucket = await newUploadBucket()
+		const chunks = ['a'.repeat(70_000), 'b'.repeat(70_000), 'c']
+		const put = await putChunked(`/${bucket}/big.bin`, { mode: 'signed', chunks })
+		expect(put.status).toBe(200)
+		expect(await (await request('GET', `/${bucket}/big.bin`)).text()).toBe(chunks.join(''))
+	})
+
+	test('a chunk changed after signing is rejected and not stored', async () => {
+		const bucket = await newUploadBucket()
+		const put = await putChunked(`/${bucket}/t.txt`, { mode: 'signed', chunks: ['hello ', 'world'], tamper: true })
+		expect(put.status).toBe(403)
+		expect(code(await put.text())).toBe('SignatureDoesNotMatch')
+		await expectNotStored(bucket, 't.txt')
+	})
+
+	test('a truncated body is rejected and not stored', async () => {
+		const bucket = await newUploadBucket()
+		const put = await putChunked(`/${bucket}/cut.txt`, { mode: 'signed', chunks: ['hello ', 'world'], truncate: true })
+		expect(put.status).toBe(400)
+		expect(code(await put.text())).toBe('IncompleteBody')
+		await expectNotStored(bucket, 'cut.txt')
+	})
+
+	test('x-amz-decoded-content-length must match the decoded bytes', async () => {
+		const bucket = await newUploadBucket()
+		const put = await putChunked(`/${bucket}/len.txt`, { mode: 'signed', chunks: ['hello world'], decodedLength: 3 })
+		expect(put.status).toBe(400)
+		expect(code(await put.text())).toBe('IncompleteBody')
+		await expectNotStored(bucket, 'len.txt')
+	})
+
+	test('a missing x-amz-decoded-content-length returns MissingContentLength', async () => {
+		const bucket = await newUploadBucket()
+		const put = await putChunked(`/${bucket}/none.txt`, { mode: 'signed', chunks: ['x'], decodedLength: null })
+		expect(put.status).toBe(411)
+		expect(code(await put.text())).toBe('MissingContentLength')
+	})
+
+	test('the size limit applies to the decoded length', async () => {
+		const bucket = await newUploadBucket()
+		const put = await putChunked(`/${bucket}/huge.bin`, { mode: 'signed', chunks: ['x'], decodedLength: config.maxFileBytes + 1 })
+		expect(put.status).toBe(400)
+		expect(code(await put.text())).toBe('EntityTooLarge')
+	})
+
+	test('signed chunks with a signed crc32 trailer are stored', async () => {
+		const bucket = await newUploadBucket()
+		const put = await putChunked(`/${bucket}/c.txt`, { mode: 'signed-trailer', chunks: ['hello ', 'world'], checksum: { algorithm: 'crc32' } })
+		expect(put.status).toBe(200)
+		expect(await (await request('GET', `/${bucket}/c.txt`)).text()).toBe('hello world')
+	})
+
+	test('signed chunks with a signed sha256 trailer are stored', async () => {
+		const bucket = await newUploadBucket()
+		const put = await putChunked(`/${bucket}/s.txt`, { mode: 'signed-trailer', chunks: ['hello ', 'world'], checksum: { algorithm: 'sha256' } })
+		expect(put.status).toBe(200)
+	})
+
+	test('signed chunks without a checksum trailer are stored', async () => {
+		const bucket = await newUploadBucket()
+		const put = await putChunked(`/${bucket}/n.txt`, { mode: 'signed-trailer', chunks: ['hello'] })
+		expect(put.status).toBe(200)
+	})
+
+	test('a wrong checksum in a signed trailer returns BadDigest and nothing is stored', async () => {
+		const bucket = await newUploadBucket()
+		const wrong = realChecksum('crc32', 'something else')
+		const put = await putChunked(`/${bucket}/bad.txt`, { mode: 'signed-trailer', chunks: ['hello world'], checksum: { algorithm: 'crc32', value: wrong } })
+		// The trailer signature covers the wrong value, so the signature is valid and the checksum is what fails.
+		expect(put.status).toBe(400)
+		expect(code(await put.text())).toBe('BadDigest')
+		await expectNotStored(bucket, 'bad.txt')
+	})
+
+	test('unsigned chunks with a crc32 trailer are stored', async () => {
+		const bucket = await newUploadBucket()
+		const put = await putChunked(`/${bucket}/u.txt`, { mode: 'unsigned-trailer', chunks: ['hello ', 'world'], checksum: { algorithm: 'crc32' } })
+		expect(put.status).toBe(200)
+		expect(await (await request('GET', `/${bucket}/u.txt`)).text()).toBe('hello world')
+	})
+
+	test('a wrong checksum in an unsigned trailer returns BadDigest and nothing is stored', async () => {
+		const bucket = await newUploadBucket()
+		const wrong = realChecksum('crc32', 'something else')
+		const put = await putChunked(`/${bucket}/ubad.txt`, { mode: 'unsigned-trailer', chunks: ['hello world'], checksum: { algorithm: 'crc32', value: wrong } })
+		expect(put.status).toBe(400)
+		expect(code(await put.text())).toBe('BadDigest')
+		await expectNotStored(bucket, 'ubad.txt')
+	})
+
+	test('other streaming payload types return NotImplemented', async () => {
+		const bucket = await newUploadBucket()
+		const put = await request('PUT', `/${bucket}/x.txt`, { body: 'x' }, { payloadHash: 'STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD' })
+		expect(put.status).toBe(501)
+	})
+
+	test('crc32 and crc32c match their standard test values', () => {
+		for (const [algorithm, hex] of [['crc32', 'cbf43926'], ['crc32c', 'e3069283']] as const) {
+			const checksum = checksumFor(algorithm)!
+			checksum.update(new TextEncoder().encode('123456789'))
+			expect(checksum.digest()).toBe(Buffer.from(hex, 'hex').toString('base64'))
+		}
 	})
 })
 

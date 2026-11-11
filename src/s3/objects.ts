@@ -2,7 +2,9 @@ import type { BunRequest } from 'bun'
 import { config } from '../config'
 import { buckets, objects, type ObjectRow } from '../db'
 import { deleteObjectFile, objectPath, readObject, writeObject } from '../storage'
+import { hasUnsignedHeaderPayload, streamingContext } from './auth'
 import { createBucket, deleteBucket, headBucket } from './buckets'
+import { announcedTrailers, decodeChunked, decodedContentLength } from './chunked'
 import { S3Error } from './errors'
 import { xmlResponse } from './responses'
 
@@ -12,16 +14,27 @@ export async function putObject(req: BunRequest<'/:bucket/*'>): Promise<Response
 	if (!objectKey(req)) return createBucket(req)
 	if (req.headers.has('x-amz-copy-source')) return copyObject(req)
 
+	// Over plain HTTP nothing else protects the body, so it must be covered by the signature: a real SHA-256 or aws-chunked.
+	if (hasUnsignedHeaderPayload(req)) {
+		throw new S3Error('InvalidRequest', 400, 'Uploads must sign the body: send its SHA-256 in x-amz-content-sha256, or use aws-chunked streaming. UNSIGNED-PAYLOAD is only accepted on presigned URLs.')
+	}
+
 	const bucket = req.params.bucket
 	const key = objectKey(req)
 	assertBucketExists(bucket)
 
-	const declaredSize = Number(req.headers.get('content-length') ?? 0)
+	// An aws-chunked body is longer than the file it carries, so the limit applies to the decoded size.
+	const streaming = streamingContext(req)
+	const decodedLength = streaming ? decodedContentLength(req) : undefined
+	const declaredSize = decodedLength ?? Number(req.headers.get('content-length') ?? 0)
 	if (declaredSize > config.maxFileBytes) {
 		throw new S3Error('EntityTooLarge', 400, 'Your proposed upload exceeds the maximum allowed object size.', `/${bucket}/${key}`)
 	}
 
-	const { etag, size } = await writeObject(objectPath(config.bucketsDir, bucket, key), req.body, signedPayloadHash(req))
+	const body = streaming && decodedLength !== undefined
+		? decodeChunked(req.body, streaming, { decodedLength, trailerNames: announcedTrailers(req) })
+		: req.body
+	const { etag, size } = await writeObject(objectPath(config.bucketsDir, bucket, key), body, signedPayloadHash(req))
 	objects.upsert({
 		bucket,
 		key,

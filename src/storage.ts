@@ -15,7 +15,7 @@ export function objectPath(bucketsDir: string, bucket: string, key: string): str
 }
 
 // expectedSha256 is the hash the client signed in x-amz-content-sha256. When given, the body must match it.
-export async function writeObject(path: string, body: ReadableStream<Uint8Array> | null, expectedSha256?: string): Promise<{ etag: string, size: number }> {
+export async function writeObject(path: string, body: AsyncIterable<Uint8Array> | null, expectedSha256?: string): Promise<{ etag: string, size: number }> {
 	await mkdir(dirname(path), { recursive: true })
 
 	// Write to a temp file first, so a failed upload never touches the object already at this path.

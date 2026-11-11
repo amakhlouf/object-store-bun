@@ -193,8 +193,8 @@ Every route except `GET /health` requires a valid signature. Errors use the S3 X
 
 - **Presigned URLs:** supported. A link works until its `X-Amz-Expires` time, up to 7 days. Its signature covers `UNSIGNED-PAYLOAD`.
 - **Range requests:** supported. A `Range` header returns 206 with the requested bytes.
-- **Chunked uploads:** SDKs that sign each chunk (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) are rejected with `NotImplemented`.
-- **Payload hash:** a header-signed upload that sends a real SHA-256 hash in `x-amz-content-sha256` is checked against the body. A mismatch returns `XAmzContentSHA256Mismatch` and nothing is stored. Uploads that sign `UNSIGNED-PAYLOAD` are not checked.
+- **Chunked uploads (`aws-chunked`):** supported in three forms: signed chunks (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`), signed chunks with a trailing checksum (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`, what the .NET SDK sends over HTTP), and unsigned chunks with a trailing checksum (`STREAMING-UNSIGNED-PAYLOAD-TRAILER`). Each chunk signature, the trailer signature, and the trailing checksum (`crc32`, `crc32c`, `sha1`, `sha256`) are checked, and a failure stores nothing. The size limit applies to `x-amz-decoded-content-length`. A `crc64nvme` checksum and the SigV4A streaming type return `NotImplemented`.
+- **Payload hash:** a header-signed upload that sends a real SHA-256 hash in `x-amz-content-sha256` is checked against the body. A mismatch returns `XAmzContentSHA256Mismatch` and nothing is stored. A header-signed upload that signs `UNSIGNED-PAYLOAD` is rejected with `InvalidRequest`, so the body is always covered by the signature. Presigned URLs still use `UNSIGNED-PAYLOAD`, because the link is made before the body exists. Signed chunked uploads are protected by their chunk signatures. The unsigned-trailer form has only its checksum, which catches corruption but not tampering.
 - **Single owner:** one access key owns every bucket.
 
 ## Before production
