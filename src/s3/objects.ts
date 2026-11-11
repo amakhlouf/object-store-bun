@@ -1,40 +1,26 @@
 import type { BunRequest } from 'bun'
 import { config } from '../config'
-import { buckets, objects, type ObjectRow } from '../db'
+import { objects, type ObjectRow } from '../db'
 import { deleteObjectFile, objectPath, readObject, writeObject } from '../storage'
-import { hasUnsignedHeaderPayload, streamingContext } from './auth'
 import { createBucket, deleteBucket, headBucket } from './buckets'
-import { announcedTrailers, decodeChunked, decodedContentLength } from './chunked'
-import { S3Error } from './errors'
+import { assertBucketExists, findObjectOrThrow, objectKey, parseCopySource } from './lookup'
+import { abortMultipartUpload, hasUploadId, isPartUpload, listMultipartUploads, listParts, uploadPart } from './multipart'
 import { xmlResponse } from './responses'
+import { uploadBody } from './upload-body'
 
 // Bucket requests can arrive with a trailing slash (PUT /bucket/), which the wildcard route catches with an empty key.
 // The signature still covers the path with the slash, so only the dispatch changes here.
 export async function putObject(req: BunRequest<'/:bucket/*'>): Promise<Response> {
 	if (!objectKey(req)) return createBucket(req)
+	if (isPartUpload(req)) return uploadPart(req)
 	if (req.headers.has('x-amz-copy-source')) return copyObject(req)
-
-	// Over plain HTTP nothing else protects the body, so it must be covered by the signature: a real SHA-256 or aws-chunked.
-	if (hasUnsignedHeaderPayload(req)) {
-		throw new S3Error('InvalidRequest', 400, 'Uploads must sign the body: send its SHA-256 in x-amz-content-sha256, or use aws-chunked streaming. UNSIGNED-PAYLOAD is only accepted on presigned URLs.')
-	}
 
 	const bucket = req.params.bucket
 	const key = objectKey(req)
 	assertBucketExists(bucket)
 
-	// An aws-chunked body is longer than the file it carries, so the limit applies to the decoded size.
-	const streaming = streamingContext(req)
-	const decodedLength = streaming ? decodedContentLength(req) : undefined
-	const declaredSize = decodedLength ?? Number(req.headers.get('content-length') ?? 0)
-	if (declaredSize > config.maxFileBytes) {
-		throw new S3Error('EntityTooLarge', 400, 'Your proposed upload exceeds the maximum allowed object size.', `/${bucket}/${key}`)
-	}
-
-	const body = streaming && decodedLength !== undefined
-		? decodeChunked(req.body, streaming, { decodedLength, trailerNames: announcedTrailers(req) })
-		: req.body
-	const { etag, size } = await writeObject(objectPath(config.bucketsDir, bucket, key), body, signedPayloadHash(req))
+	const { body, sha256 } = uploadBody(req, `/${bucket}/${key}`)
+	const { etag, size } = await writeObject(objectPath(config.bucketsDir, bucket, key), body, sha256)
 	objects.upsert({
 		bucket,
 		key,
@@ -45,12 +31,6 @@ export async function putObject(req: BunRequest<'/:bucket/*'>): Promise<Response
 	})
 
 	return new Response(null, { status: 200, headers: { ETag: `"${etag}"` } })
-}
-
-// The body hash the client signed. UNSIGNED-PAYLOAD (and presigned requests) has no hash to check against.
-function signedPayloadHash(req: Request): string | undefined {
-	const value = req.headers.get('x-amz-content-sha256') ?? ''
-	return /^[0-9a-f]{64}$/i.test(value) ? value : undefined
 }
 
 // PUT with an x-amz-copy-source header copies an existing object. The request has no body.
@@ -73,19 +53,10 @@ async function copyObject(req: BunRequest<'/:bucket/*'>): Promise<Response> {
 	return xmlResponse({ CopyObjectResult: { LastModified: lastModified, ETag: `"${etag}"` } })
 }
 
-// The header is "/bucket/key" or "bucket/key", URL-encoded.
-function parseCopySource(header: string): { bucket: string, key: string } {
-	const path = decodeURIComponent(header).replace(/^\//, '')
-	const slash = path.indexOf('/')
-	if (slash <= 0 || slash === path.length - 1) {
-		throw new S3Error('InvalidArgument', 400, 'Invalid copy source object key.')
-	}
-	return { bucket: path.slice(0, slash), key: path.slice(slash + 1) }
-}
-
-export function getObject(req: BunRequest<'/:bucket/*'>): Response {
+export function getObject(req: BunRequest<'/:bucket/*'>): Response | Promise<Response> {
 	// Bucket listing requests can arrive with a trailing slash (GET /bucket/), which the wildcard route catches.
 	if (!objectKey(req)) return listObjects(req)
+	if (hasUploadId(req)) return listParts(req)
 
 	const bucket = req.params.bucket
 	const key = objectKey(req)
@@ -105,6 +76,7 @@ export function headObject(req: BunRequest<'/:bucket/*'>): Response {
 
 export async function deleteObject(req: BunRequest<'/:bucket/*'>): Promise<Response> {
 	if (!objectKey(req)) return deleteBucket(req)
+	if (hasUploadId(req)) return abortMultipartUpload(req)
 
 	const bucket = req.params.bucket
 	const key = objectKey(req)
@@ -117,6 +89,8 @@ export async function deleteObject(req: BunRequest<'/:bucket/*'>): Promise<Respo
 }
 
 export function listObjects(req: BunRequest<'/:bucket'>): Response {
+	if (new URL(req.url).searchParams.has('uploads')) return listMultipartUploads(req)
+
 	const bucket = req.params.bucket
 	assertBucketExists(bucket)
 
@@ -130,7 +104,8 @@ export function listObjects(req: BunRequest<'/:bucket'>): Response {
 
 	const rows = objects.list(bucket, prefix, after, maxKeys + 1)
 	const page = rows.slice(0, maxKeys)
-	const truncated = rows.length > maxKeys
+	// max-keys=0 is an empty page, not a truncated one: there would be no key to use as the continuation token.
+	const truncated = maxKeys > 0 && rows.length > maxKeys
 
 	const contents: object[] = []
 	const commonPrefixes = new Set<string>()
@@ -168,11 +143,6 @@ export function listObjects(req: BunRequest<'/:bucket'>): Response {
 	})
 }
 
-function objectKey(req: Request): string {
-	const path = new URL(req.url).pathname
-	return decodeURIComponent(path.slice(path.indexOf('/', 1) + 1))
-}
-
 function objectHeaders(row: ObjectRow): Record<string, string> {
 	return {
 		'Content-Type': row.content_type,
@@ -183,17 +153,3 @@ function objectHeaders(row: ObjectRow): Record<string, string> {
 	}
 }
 
-function findObjectOrThrow(bucket: string, key: string): ObjectRow {
-	const row = objects.get(bucket, key)
-	if (!row) {
-		throw new S3Error('NoSuchKey', 404, 'The specified key does not exist.', `/${bucket}/${key}`)
-	}
-	return row
-}
-
-function assertBucketExists(bucket: string): void {
-	const exists = buckets.exists(bucket)
-	if (!exists) {
-		throw new S3Error('NoSuchBucket', 404, 'The specified bucket does not exist.', `/${bucket}`)
-	}
-}

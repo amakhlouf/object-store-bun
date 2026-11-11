@@ -4,6 +4,7 @@ import { log } from './log'
 import { checkAuth } from './s3/auth'
 import { createBucket, deleteBucket, headBucket, listBuckets } from './s3/buckets'
 import { errorToResponse } from './s3/errors'
+import { postObject, startUploadSweeper } from './s3/multipart'
 import { deleteObject, getObject, headObject, listObjects, putObject } from './s3/objects'
 
 // Every routed handler checks the request signature before it runs.
@@ -50,11 +51,14 @@ export const server = Bun.serve({
 			GET: logged(authed(getObject)),
 			HEAD: logged(authed(headObject)),
 			PUT: logged(authed(putObject)),
+			POST: logged(authed(postObject)),
 			DELETE: logged(authed(deleteObject)),
 		},
 	},
 	fetch: () => new Response('Not Implemented', { status: 501 }),
 	error: errorToResponse,
 })
+
+startUploadSweeper()
 
 console.log(`S3 storage listening on ${server.url}`)

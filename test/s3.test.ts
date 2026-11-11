@@ -1,13 +1,15 @@
 import { afterAll, describe, expect, spyOn, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join, resolve, sep } from 'node:path'
 import { Database } from 'bun:sqlite'
 import { backup } from '../src/backup'
 import { config, loadConfig } from '../src/config'
+import { uploads } from '../src/db'
 import { server } from '../src/index'
 import { signatureFor } from '../src/s3/auth'
 import { checksumFor } from '../src/s3/chunked'
+import { expireUploads, MIN_PART_BYTES } from '../src/s3/multipart'
 import { objectPath, writeObject } from '../src/storage'
 
 // Remove the temp data folder after the run, even if tests failed.
@@ -696,6 +698,657 @@ describe('aws-chunked uploads', () => {
 			const checksum = checksumFor(algorithm)!
 			checksum.update(new TextEncoder().encode('123456789'))
 			expect(checksum.digest()).toBe(Buffer.from(hex, 'hex').toString('base64'))
+		}
+	})
+})
+
+describe('multipart upload', () => {
+	const md5 = (data: string) => new Bun.CryptoHasher('md5').update(data).digest('hex')
+	// Every part except the last must be at least 5 MiB, so tests that join several parts use one this size first.
+	const big = 'a'.repeat(MIN_PART_BYTES)
+
+	// S3's multipart ETag: the MD5 of the parts' binary MD5s, then "-" and the part count.
+	function multipartEtag(...parts: string[]): string {
+		const hasher = new Bun.CryptoHasher('md5')
+		for (const part of parts) hasher.update(Buffer.from(md5(part), 'hex'))
+		return `${hasher.digest('hex')}-${parts.length}`
+	}
+
+	const completeXml = (parts: [number, string][]) =>
+		`<CompleteMultipartUpload>${parts.map(([n, etag]) => `<Part><PartNumber>${n}</PartNumber><ETag>"${etag}"</ETag></Part>`).join('')}</CompleteMultipartUpload>`
+
+	async function newBucketForUpload(): Promise<string> {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		return name
+	}
+
+	async function start(bucket: string, key: string, headers: Record<string, string> = {}): Promise<string> {
+		const res = await request('POST', `/${bucket}/${key}?uploads`, { headers })
+		expect(res.status).toBe(200)
+		return /<UploadId>([^<]+)<\/UploadId>/.exec(await res.text())![1]!
+	}
+
+	const putPart = (bucket: string, key: string, uploadId: string, number: number | string, body: string) =>
+		request('PUT', `/${bucket}/${key}?partNumber=${number}&uploadId=${uploadId}`, { body })
+
+	const complete = (bucket: string, key: string, uploadId: string, parts: [number, string][]) =>
+		request('POST', `/${bucket}/${key}?uploadId=${uploadId}`, { body: completeXml(parts) })
+
+	test('create, upload parts, complete: the object is the parts joined, with the multipart ETag', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'dir/big.txt', { 'Content-Type': 'text/plain' })
+
+		const first = await putPart(bucket, 'dir/big.txt', uploadId, 1, big)
+		const second = await putPart(bucket, 'dir/big.txt', uploadId, 2, 'world')
+		expect(first.status).toBe(200)
+		expect(first.headers.get('etag')).toBe(`"${md5(big)}"`)
+
+		const done = await complete(bucket, 'dir/big.txt', uploadId, [[1, md5(big)], [2, md5('world')]])
+		expect(done.status).toBe(200)
+		const etag = multipartEtag(big, 'world')
+		expect(await done.text()).toContain(`<ETag>"${etag}"</ETag>`)
+		expect(second.status).toBe(200)
+
+		const get = await request('GET', `/${bucket}/dir/big.txt`)
+		expect(await get.text()).toBe(`${big}world`)
+		expect(get.headers.get('etag')).toBe(`"${etag}"`)
+		expect(get.headers.get('content-type')).toBe('text/plain')
+		expect(existsSync(join(config.uploadsDir, uploadId))).toBe(false)
+	})
+
+	test('parts can be uploaded out of order and any part can be left out of the list', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'o.txt')
+		await putPart(bucket, 'o.txt', uploadId, 3, 'C')
+		await putPart(bucket, 'o.txt', uploadId, 1, big)
+		await putPart(bucket, 'o.txt', uploadId, 2, 'unused')
+
+		const done = await complete(bucket, 'o.txt', uploadId, [[1, md5(big)], [3, md5('C')]])
+		expect(done.status).toBe(200)
+		expect(await (await request('GET', `/${bucket}/o.txt`)).text()).toBe(`${big}C`)
+	})
+
+	test('a part under 5 MiB is only allowed as the last part', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'small.txt')
+		await putPart(bucket, 'small.txt', uploadId, 1, 'tiny')
+		await putPart(bucket, 'small.txt', uploadId, 2, 'also tiny')
+
+		const done = await complete(bucket, 'small.txt', uploadId, [[1, md5('tiny')], [2, md5('also tiny')]])
+		expect(done.status).toBe(400)
+		expect(code(await done.text())).toBe('EntityTooSmall')
+		expect((await request('GET', `/${bucket}/small.txt`)).status).toBe(404)
+
+		// The same upload completes when the small part is the last one, or the only one.
+		expect((await complete(bucket, 'small.txt', uploadId, [[2, md5('also tiny')]])).status).toBe(200)
+		expect(await (await request('GET', `/${bucket}/small.txt`)).text()).toBe('also tiny')
+	})
+
+	test('uploading a part number again replaces the earlier part', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'r.txt')
+		await putPart(bucket, 'r.txt', uploadId, 1, 'old')
+		await putPart(bucket, 'r.txt', uploadId, 1, 'new!')
+
+		const stale = await complete(bucket, 'r.txt', uploadId, [[1, md5('old')]])
+		expect(stale.status).toBe(400)
+		expect(code(await stale.text())).toBe('InvalidPart')
+
+		expect((await complete(bucket, 'r.txt', uploadId, [[1, md5('new!')]])).status).toBe(200)
+		expect(await (await request('GET', `/${bucket}/r.txt`)).text()).toBe('new!')
+	})
+
+	test('a parts list out of order returns InvalidPartOrder', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'order.txt')
+		await putPart(bucket, 'order.txt', uploadId, 1, 'a')
+		await putPart(bucket, 'order.txt', uploadId, 2, 'b')
+
+		const done = await complete(bucket, 'order.txt', uploadId, [[2, md5('b')], [1, md5('a')]])
+		expect(done.status).toBe(400)
+		expect(code(await done.text())).toBe('InvalidPartOrder')
+	})
+
+	test('a wrong ETag or a part that was never uploaded returns InvalidPart and stores nothing', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'bad.txt')
+		await putPart(bucket, 'bad.txt', uploadId, 1, 'a')
+
+		const wrong = await complete(bucket, 'bad.txt', uploadId, [[1, md5('different')]])
+		expect(wrong.status).toBe(400)
+		expect(code(await wrong.text())).toBe('InvalidPart')
+
+		const missing = await complete(bucket, 'bad.txt', uploadId, [[1, md5('a')], [2, md5('b')]])
+		expect(code(await missing.text())).toBe('InvalidPart')
+		expect((await request('GET', `/${bucket}/bad.txt`)).status).toBe(404)
+	})
+
+	test('an empty or malformed parts list returns MalformedXML', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'x.txt')
+		const res = await request('POST', `/${bucket}/x.txt?uploadId=${uploadId}`, { body: '<CompleteMultipartUpload></CompleteMultipartUpload>' })
+		expect(res.status).toBe(400)
+		expect(code(await res.text())).toBe('MalformedXML')
+	})
+
+	test('completing over the size limit returns EntityTooLarge and keeps the old object', async () => {
+		const bucket = await newBucketForUpload()
+		await request('PUT', `/${bucket}/limit.bin`, { body: 'old object' })
+		const uploadId = await start(bucket, 'limit.bin')
+		// Each part is within the limit and at least 5 MiB, but together they are over it.
+		const half = 'x'.repeat(Math.max(MIN_PART_BYTES, Math.ceil(config.maxFileBytes * 0.6)))
+		await putPart(bucket, 'limit.bin', uploadId, 1, half)
+		await putPart(bucket, 'limit.bin', uploadId, 2, half)
+
+		const done = await complete(bucket, 'limit.bin', uploadId, [[1, md5(half)], [2, md5(half)]])
+		expect(done.status).toBe(400)
+		expect(code(await done.text())).toBe('EntityTooLarge')
+		expect(await (await request('GET', `/${bucket}/limit.bin`)).text()).toBe('old object')
+	})
+
+	test('abort removes the parts, and the upload is gone afterwards', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'abort.txt')
+		await putPart(bucket, 'abort.txt', uploadId, 1, 'a')
+		expect(existsSync(join(config.uploadsDir, uploadId))).toBe(true)
+
+		const abort = await request('DELETE', `/${bucket}/abort.txt?uploadId=${uploadId}`)
+		expect(abort.status).toBe(204)
+		expect(existsSync(join(config.uploadsDir, uploadId))).toBe(false)
+
+		const late = await putPart(bucket, 'abort.txt', uploadId, 2, 'b')
+		expect(late.status).toBe(404)
+		expect(code(await late.text())).toBe('NoSuchUpload')
+		expect((await request('DELETE', `/${bucket}/abort.txt?uploadId=${uploadId}`)).status).toBe(404)
+	})
+
+	test('an unknown upload ID, or the wrong key, returns NoSuchUpload', async () => {
+		const bucket = await newBucketForUpload()
+		const unknown = await putPart(bucket, 'a.txt', 'doesnotexist', 1, 'x')
+		expect(unknown.status).toBe(404)
+		expect(code(await unknown.text())).toBe('NoSuchUpload')
+
+		const uploadId = await start(bucket, 'a.txt')
+		const otherKey = await putPart(bucket, 'b.txt', uploadId, 1, 'x')
+		expect(otherKey.status).toBe(404)
+		expect(code(await otherKey.text())).toBe('NoSuchUpload')
+	})
+
+	test('part numbers must be between 1 and 10000', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'n.txt')
+		for (const number of ['0', '10001', 'abc', '-1']) {
+			const res = await putPart(bucket, 'n.txt', uploadId, number, 'x')
+			expect(res.status).toBe(400)
+			expect(code(await res.text())).toBe('InvalidArgument')
+		}
+	})
+
+	test('starting an upload in a missing bucket returns NoSuchBucket', async () => {
+		const res = await request('POST', `/${newBucket()}/k.txt?uploads`)
+		expect(res.status).toBe(404)
+		expect(code(await res.text())).toBe('NoSuchBucket')
+	})
+
+	test('a part must be covered by the signature, like any upload', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'sig.txt')
+		const url = `/${bucket}/sig.txt?partNumber=1&uploadId=${uploadId}`
+
+		const unsigned = await request('PUT', url, { body: 'x' }, { payloadHash: 'UNSIGNED-PAYLOAD' })
+		expect(unsigned.status).toBe(400)
+		expect(code(await unsigned.text())).toBe('InvalidRequest')
+
+		const claimed = new Bun.CryptoHasher('sha256').update('the bytes the client signed').digest('hex')
+		const swapped = await request('PUT', url, { body: 'swapped bytes' }, { payloadHash: claimed })
+		expect(swapped.status).toBe(400)
+		expect(code(await swapped.text())).toBe('XAmzContentSHA256Mismatch')
+
+		const done = await complete(bucket, 'sig.txt', uploadId, [[1, md5('swapped bytes')]])
+		expect(code(await done.text())).toBe('InvalidPart')
+	})
+
+	test('the parts list must be signed too', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'list.txt')
+		await putPart(bucket, 'list.txt', uploadId, 1, 'a')
+		const res = await request('POST', `/${bucket}/list.txt?uploadId=${uploadId}`, { body: completeXml([[1, md5('a')]]) }, { payloadHash: 'UNSIGNED-PAYLOAD' })
+		expect(res.status).toBe(400)
+		expect(code(await res.text())).toBe('InvalidRequest')
+	})
+
+	const copyPart = (bucket: string, key: string, uploadId: string, number: number, source: string, range?: string) =>
+		request('PUT', `/${bucket}/${key}?partNumber=${number}&uploadId=${uploadId}`, {
+			headers: { 'x-amz-copy-source': source, ...(range ? { 'x-amz-copy-source-range': range } : {}) },
+		})
+
+	test('UploadPartCopy copies a whole object or a byte range into a part', async () => {
+		const bucket = await newBucketForUpload()
+		await request('PUT', `/${bucket}/src.bin`, { body: `${big}tail` })
+		const uploadId = await start(bucket, 'dest.bin')
+
+		const first = await copyPart(bucket, 'dest.bin', uploadId, 1, `/${bucket}/src.bin`, `bytes=0-${MIN_PART_BYTES - 1}`)
+		expect(first.status).toBe(200)
+		expect(await first.text()).toContain(`<ETag>"${md5(big)}"</ETag>`)
+		const second = await copyPart(bucket, 'dest.bin', uploadId, 2, `${bucket}/src.bin`, `bytes=${MIN_PART_BYTES}-${MIN_PART_BYTES + 3}`)
+		expect(second.status).toBe(200)
+
+		const done = await complete(bucket, 'dest.bin', uploadId, [[1, md5(big)], [2, md5('tail')]])
+		expect(done.status).toBe(200)
+		expect(await (await request('GET', `/${bucket}/dest.bin`)).text()).toBe(`${big}tail`)
+
+		const whole = await start(bucket, 'whole.bin')
+		const wholeCopy = await copyPart(bucket, 'whole.bin', whole, 1, `/${bucket}/src.bin`)
+		expect(await wholeCopy.text()).toContain(`<ETag>"${md5(`${big}tail`)}"</ETag>`)
+	})
+
+	test('UploadPartCopy rejects a missing source and a bad range', async () => {
+		const bucket = await newBucketForUpload()
+		await request('PUT', `/${bucket}/small.bin`, { body: '0123456789' })
+		const uploadId = await start(bucket, 'dest.bin')
+
+		const missing = await copyPart(bucket, 'dest.bin', uploadId, 1, `/${bucket}/nope.bin`)
+		expect(missing.status).toBe(404)
+		expect(code(await missing.text())).toBe('NoSuchKey')
+
+		const beyond = await copyPart(bucket, 'dest.bin', uploadId, 1, `/${bucket}/small.bin`, 'bytes=5-10')
+		expect(beyond.status).toBe(400)
+		expect(code(await beyond.text())).toBe('InvalidRequest')
+
+		const malformed = await copyPart(bucket, 'dest.bin', uploadId, 1, `/${bucket}/small.bin`, 'bytes=abc')
+		expect(code(await malformed.text())).toBe('InvalidArgument')
+	})
+
+	const partNumbers = (xml: string) => [...xml.matchAll(/<PartNumber>(\d+)<\/PartNumber>/g)].map(match => Number(match[1]))
+
+	test('ListParts lists the uploaded parts a page at a time', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'parts.txt')
+		await putPart(bucket, 'parts.txt', uploadId, 3, 'ccc')
+		await putPart(bucket, 'parts.txt', uploadId, 1, 'a')
+		await putPart(bucket, 'parts.txt', uploadId, 2, 'bb')
+
+		const all = await (await request('GET', `/${bucket}/parts.txt?uploadId=${uploadId}`)).text()
+		expect(partNumbers(all)).toEqual([1, 2, 3])
+		expect(all).toContain(`<ETag>"${md5('bb')}"</ETag>`)
+		expect(all).toContain('<Size>2</Size>')
+		expect(all).toContain('<IsTruncated>false</IsTruncated>')
+
+		const page = await (await request('GET', `/${bucket}/parts.txt?uploadId=${uploadId}&max-parts=2`)).text()
+		expect(partNumbers(page)).toEqual([1, 2])
+		expect(page).toContain('<IsTruncated>true</IsTruncated>')
+		expect(page).toContain('<NextPartNumberMarker>2</NextPartNumberMarker>')
+
+		const rest = await (await request('GET', `/${bucket}/parts.txt?uploadId=${uploadId}&part-number-marker=2`)).text()
+		expect(partNumbers(rest)).toEqual([3])
+		expect(rest).toContain('<IsTruncated>false</IsTruncated>')
+	})
+
+	test('ListParts on an unknown upload returns NoSuchUpload', async () => {
+		const bucket = await newBucketForUpload()
+		const res = await request('GET', `/${bucket}/x.txt?uploadId=doesnotexist`)
+		expect(res.status).toBe(404)
+		expect(code(await res.text())).toBe('NoSuchUpload')
+	})
+
+	const uploadKeys = (xml: string) => [...xml.matchAll(/<Upload>[\s\S]*?<Key>([^<]*)<\/Key>/g)].map(match => match[1])
+	const uploadIds = (xml: string) => [...xml.matchAll(/<UploadId>([^<]+)<\/UploadId>/g)].map(match => match[1])
+
+	test('ListMultipartUploads lists uploads in progress, with prefix and delimiter', async () => {
+		const bucket = await newBucketForUpload()
+		await start(bucket, 'a/1.txt')
+		await start(bucket, 'a/2.txt')
+		await start(bucket, 'b.txt')
+		const finished = await start(bucket, 'done.txt')
+		await putPart(bucket, 'done.txt', finished, 1, 'x')
+		await complete(bucket, 'done.txt', finished, [[1, md5('x')]])
+		const stopped = await start(bucket, 'stopped.txt')
+		await request('DELETE', `/${bucket}/stopped.txt?uploadId=${stopped}`)
+
+		const all = await (await request('GET', `/${bucket}?uploads`)).text()
+		expect(uploadKeys(all)).toEqual(['a/1.txt', 'a/2.txt', 'b.txt'])
+		expect(all).toContain('<IsTruncated>false</IsTruncated>')
+
+		const slash = await (await request('GET', `/${bucket}/?uploads`)).text()
+		expect(uploadKeys(slash)).toEqual(['a/1.txt', 'a/2.txt', 'b.txt'])
+
+		const prefixed = await (await request('GET', `/${bucket}?uploads&prefix=a/`)).text()
+		expect(uploadKeys(prefixed)).toEqual(['a/1.txt', 'a/2.txt'])
+
+		const grouped = await (await request('GET', `/${bucket}?uploads&delimiter=/`)).text()
+		expect(uploadKeys(grouped)).toEqual(['b.txt'])
+		expect(grouped).toContain('<CommonPrefixes><Prefix>a/</Prefix></CommonPrefixes>')
+	})
+
+	test('ListMultipartUploads pages through uploads with the key and upload ID markers', async () => {
+		const bucket = await newBucketForUpload()
+		const first = await start(bucket, 'same.txt')
+		const second = await start(bucket, 'same.txt')
+		await start(bucket, 'z.txt')
+
+		const page1 = await (await request('GET', `/${bucket}?uploads&max-uploads=1`)).text()
+		expect(uploadKeys(page1)).toEqual(['same.txt'])
+		expect(page1).toContain('<IsTruncated>true</IsTruncated>')
+		const [firstListed] = uploadIds(page1)
+		expect([first, second]).toContain(firstListed!)
+		expect(page1).toContain('<NextKeyMarker>same.txt</NextKeyMarker>')
+		expect(page1).toContain(`<NextUploadIdMarker>${firstListed}</NextUploadIdMarker>`)
+
+		const page2 = await (await request('GET', `/${bucket}?uploads&max-uploads=1&key-marker=same.txt&upload-id-marker=${firstListed}`)).text()
+		expect(uploadKeys(page2)).toEqual(['same.txt'])
+		expect(new Set([firstListed, uploadIds(page2)[0]])).toEqual(new Set([first, second]))
+
+		const page3 = await (await request('GET', `/${bucket}?uploads&max-uploads=5&key-marker=same.txt&upload-id-marker=${uploadIds(page2)[0]}`)).text()
+		expect(uploadKeys(page3)).toEqual(['z.txt'])
+		expect(page3).toContain('<IsTruncated>false</IsTruncated>')
+	})
+
+	test('ListMultipartUploads in a missing bucket returns NoSuchBucket', async () => {
+		const res = await request('GET', `/${newBucket()}?uploads`)
+		expect(res.status).toBe(404)
+		expect(code(await res.text())).toBe('NoSuchBucket')
+	})
+
+	test('uploads older than UPLOAD_EXPIRY_DAYS are aborted and their parts removed', async () => {
+		const bucket = await newBucketForUpload()
+		const old = {
+			upload_id: `expired${crypto.randomUUID().replaceAll('-', '')}`,
+			bucket,
+			key: 'old.txt',
+			content_type: 'text/plain',
+			created_at: new Date(Date.now() - (config.uploadExpiryDays + 1) * 24 * 60 * 60 * 1000).toISOString(),
+		}
+		uploads.create(old)
+		uploads.putPart({ upload_id: old.upload_id, part_number: 1, size: 1, etag: md5('x') })
+		const oldFolder = join(config.uploadsDir, old.upload_id)
+		mkdirSync(oldFolder, { recursive: true })
+		writeFileSync(join(oldFolder, '1'), 'x')
+		// The upload is abandoned: it was started long ago and its newest part is just as old.
+		utimesSync(join(oldFolder, '1'), new Date(old.created_at), new Date(old.created_at))
+		const fresh = await start(bucket, 'fresh.txt')
+
+		expect(await expireUploads()).toBeGreaterThanOrEqual(1)
+		expect(uploads.get(old.upload_id)).toBeNull()
+		expect(uploads.parts(old.upload_id)).toEqual([])
+		expect(existsSync(oldFolder)).toBe(false)
+		expect(uploads.get(fresh)).not.toBeNull()
+	})
+
+	test('with UPLOAD_EXPIRY_DAYS at 0, old uploads are kept', async () => {
+		const bucket = await newBucketForUpload()
+		const old = {
+			upload_id: `keep${crypto.randomUUID().replaceAll('-', '')}`,
+			bucket,
+			key: 'keep.txt',
+			content_type: 'text/plain',
+			created_at: new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString(),
+		}
+		uploads.create(old)
+		const days = config.uploadExpiryDays
+		config.uploadExpiryDays = 0
+		try {
+			await expireUploads()
+			expect(uploads.get(old.upload_id)).not.toBeNull()
+		} finally {
+			config.uploadExpiryDays = days
+			uploads.remove(old.upload_id)
+		}
+	})
+
+	test('a part folder that no upload owns is removed after an hour, not before', async () => {
+		mkdirSync(config.uploadsDir, { recursive: true })
+		const stale = join(config.uploadsDir, `orphan-old-${crypto.randomUUID()}`)
+		const recent = join(config.uploadsDir, `orphan-new-${crypto.randomUUID()}`)
+		mkdirSync(stale)
+		mkdirSync(recent)
+		const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
+		utimesSync(stale, twoHoursAgo, twoHoursAgo)
+
+		try {
+			await expireUploads()
+			expect(existsSync(stale)).toBe(false)
+			expect(existsSync(recent)).toBe(true)
+		} finally {
+			rmSync(recent, { recursive: true, force: true })
+		}
+	})
+
+	test('an old upload that is still receiving parts is not expired', async () => {
+		const bucket = await newBucketForUpload()
+		const busy = {
+			upload_id: `busy${crypto.randomUUID().replaceAll('-', '')}`,
+			bucket,
+			key: 'busy.txt',
+			content_type: 'text/plain',
+			created_at: new Date(Date.now() - (config.uploadExpiryDays + 1) * 24 * 60 * 60 * 1000).toISOString(),
+		}
+		uploads.create(busy)
+		uploads.putPart({ upload_id: busy.upload_id, part_number: 1, size: 1, etag: md5('x') })
+		const folder = join(config.uploadsDir, busy.upload_id)
+		mkdirSync(folder, { recursive: true })
+		writeFileSync(join(folder, '1'), 'x') // written just now
+
+		try {
+			await expireUploads()
+			expect(uploads.get(busy.upload_id)).not.toBeNull()
+			expect(existsSync(folder)).toBe(true)
+		} finally {
+			uploads.remove(busy.upload_id)
+			rmSync(folder, { recursive: true, force: true })
+		}
+	})
+
+	// A request body that arrives in pieces, with a pause between them. It is signed with the hash of the whole body.
+	function slowBody(first: string, second: string, pauseMs: number): ReadableStream<Uint8Array> {
+		const encoder = new TextEncoder()
+		return new ReadableStream({
+			async start(controller) {
+				controller.enqueue(encoder.encode(first))
+				await Bun.sleep(pauseMs)
+				controller.enqueue(encoder.encode(second))
+				controller.close()
+			},
+		})
+	}
+	const sha256 = (data: string) => new Bun.CryptoHasher('sha256').update(data).digest('hex')
+
+	test('an abort waits for a part that is being written, and leaves nothing behind', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'race.txt')
+		const url = `/${bucket}/race.txt?partNumber=1&uploadId=${uploadId}`
+
+		const part = request('PUT', url, { body: slowBody('slow ', 'part', 400), duplex: 'half' } as RequestInit, { payloadHash: sha256('slow part') })
+		await Bun.sleep(100)
+		const abort = request('DELETE', `/${bucket}/race.txt?uploadId=${uploadId}`)
+
+		// The part is still arriving, so the abort has to wait for it instead of deleting the upload underneath it.
+		const early = await Promise.race([abort.then(() => 'finished'), Bun.sleep(100).then(() => 'waiting')])
+		expect(early).toBe('waiting')
+
+		expect((await part).status).toBe(200)
+		expect((await abort).status).toBe(204)
+		expect(uploads.get(uploadId)).toBeNull()
+		expect(uploads.parts(uploadId)).toEqual([])
+		expect(existsSync(join(config.uploadsDir, uploadId))).toBe(false)
+	})
+
+	test('two Completes at once: one succeeds, the other gets NoSuchUpload, and nobody gets a server error', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'twice.txt')
+		await putPart(bucket, 'twice.txt', uploadId, 1, 'only part')
+
+		const results = await Promise.all([
+			complete(bucket, 'twice.txt', uploadId, [[1, md5('only part')]]),
+			complete(bucket, 'twice.txt', uploadId, [[1, md5('only part')]]),
+		])
+		expect(results.map(res => res.status).sort()).toEqual([200, 404])
+		expect(await (await request('GET', `/${bucket}/twice.txt`)).text()).toBe('only part')
+	})
+
+	test('Complete and Abort at once: one wins and the upload is gone, with no server error', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'either.txt')
+		await putPart(bucket, 'either.txt', uploadId, 1, 'data')
+
+		const [done, aborted] = await Promise.all([
+			complete(bucket, 'either.txt', uploadId, [[1, md5('data')]]),
+			request('DELETE', `/${bucket}/either.txt?uploadId=${uploadId}`),
+		])
+		expect([done.status, aborted.status]).not.toContain(500)
+		expect([done.status, aborted.status]).toContain(404)
+		expect((await request('GET', `/${bucket}/either.txt`)).status).toBe(done.status === 200 ? 200 : 404)
+		expect(uploads.get(uploadId)).toBeNull()
+		expect(existsSync(join(config.uploadsDir, uploadId))).toBe(false)
+	})
+
+	test('a PUT with only uploadId or only partNumber is rejected and does not overwrite the object', async () => {
+		const bucket = await newBucketForUpload()
+		await request('PUT', `/${bucket}/keep.txt`, { body: 'original' })
+		const uploadId = await start(bucket, 'keep.txt')
+
+		for (const query of [`uploadId=${uploadId}`, 'partNumber=1', 'uploadId=typo']) {
+			const res = await request('PUT', `/${bucket}/keep.txt?${query}`, { body: 'overwritten' })
+			expect(res.status).toBe(400)
+			expect(code(await res.text())).toBe('InvalidArgument')
+		}
+		expect(await (await request('GET', `/${bucket}/keep.txt`)).text()).toBe('original')
+	})
+
+	test('a parts list over the size limit is rejected without reading it all', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'big-list.txt')
+		const url = `/${bucket}/big-list.txt?uploadId=${uploadId}`
+
+		const byLength = await request('POST', url, { body: 'x'.repeat(1024 * 1024 + 1) })
+		expect(byLength.status).toBe(400)
+		expect(code(await byLength.text())).toBe('EntityTooLarge')
+
+		// No Content-Length: the body is read only up to the limit.
+		const half = 'x'.repeat(600 * 1024)
+		const streamed = await request('POST', url, { body: slowBody(half, half, 10), duplex: 'half' } as RequestInit, { payloadHash: sha256(half + half) })
+		expect(streamed.status).toBe(400)
+		expect(code(await streamed.text())).toBe('EntityTooLarge')
+	})
+
+	test('a page size of 0 is an empty page that is not truncated', async () => {
+		const bucket = await newBucketForUpload()
+		await request('PUT', `/${bucket}/a.txt`, { body: 'a' })
+		const uploadId = await start(bucket, 'z.txt')
+		await putPart(bucket, 'z.txt', uploadId, 1, 'x')
+
+		const parts = await (await request('GET', `/${bucket}/z.txt?uploadId=${uploadId}&max-parts=0`)).text()
+		expect(partNumbers(parts)).toEqual([])
+		expect(parts).toContain('<IsTruncated>false</IsTruncated>')
+		expect(parts).not.toContain('NextPartNumberMarker')
+
+		const listed = await (await request('GET', `/${bucket}?uploads&max-uploads=0`)).text()
+		expect(uploadKeys(listed)).toEqual([])
+		expect(listed).toContain('<IsTruncated>false</IsTruncated>')
+		expect(listed).not.toContain('NextKeyMarker')
+
+		const objectsPage = await (await request('GET', `/${bucket}?list-type=2&max-keys=0`)).text()
+		expect(objectsPage).toContain('<IsTruncated>false</IsTruncated>')
+		expect(objectsPage).not.toContain('NextContinuationToken')
+	})
+
+	test('a broken percent sequence in the copy source or the path is a 400, not a server error', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'dest.txt')
+
+		const partCopy = await copyPart(bucket, 'dest.txt', uploadId, 1, '/%E0%A4%A')
+		expect(partCopy.status).toBe(400)
+		expect(code(await partCopy.text())).toBe('InvalidArgument')
+
+		const objectCopy = await request('PUT', `/${bucket}/copy.txt`, { headers: { 'x-amz-copy-source': '/%E0%A4%A' } })
+		expect(objectCopy.status).toBe(400)
+		expect(code(await objectCopy.text())).toBe('InvalidArgument')
+
+		const path = await request('GET', `/${bucket}/%E0%A4%A`)
+		expect(path.status).toBe(400)
+		expect(code(await path.text())).toBe('InvalidURI')
+	})
+
+	test('Complete rejects a part file that no longer matches what was recorded for it', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'drift.txt')
+		await putPart(bucket, 'drift.txt', uploadId, 1, 'abc')
+		writeFileSync(join(config.uploadsDir, uploadId, '1'), 'abcdef') // changed behind the database's back
+
+		const done = await complete(bucket, 'drift.txt', uploadId, [[1, md5('abc')]])
+		expect(done.status).toBe(400)
+		expect(code(await done.text())).toBe('InvalidPart')
+		expect((await request('GET', `/${bucket}/drift.txt`)).status).toBe(404)
+	})
+
+	test('part numbers are digits only, and leading zeros name the same part', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'digits.txt')
+		for (const bad of ['', ' 1', '1e3', '1.0', '+1', '0x1']) {
+			const res = await putPart(bucket, 'digits.txt', uploadId, encodeURIComponent(bad), 'x')
+			expect(res.status).toBe(400)
+			expect(code(await res.text())).toBe('InvalidArgument')
+		}
+
+		expect((await putPart(bucket, 'digits.txt', uploadId, '01', 'zero padded')).status).toBe(200)
+		expect((await complete(bucket, 'digits.txt', uploadId, [[1, md5('zero padded')]])).status).toBe(200)
+		expect(await (await request('GET', `/${bucket}/digits.txt`)).text()).toBe('zero padded')
+	})
+
+	test('ListMultipartUploads matches a prefix with characters outside the basic plane', async () => {
+		const bucket = await newBucketForUpload()
+		for (const key of ['😀/one.txt', '😀/two.txt', 'plain.txt']) await start(bucket, encodeURI(key))
+
+		const listed = await (await request('GET', `/${bucket}?uploads&prefix=${encodeURIComponent('😀/')}`)).text()
+		expect(uploadKeys(listed)).toEqual(['😀/one.txt', '😀/two.txt'])
+	})
+
+	test('ListMultipartUploads with a delimiter reads in batches and pages past a whole common prefix', async () => {
+		const bucket = await newBucketForUpload()
+		const created = new Date().toISOString()
+		// More uploads under one prefix than one batch reads.
+		for (let i = 0; i < 1200; i++) {
+			uploads.create({ upload_id: `batch${i}-${bucket}`, bucket, key: `many/k${String(i).padStart(4, '0')}`, content_type: 'x', created_at: created })
+		}
+		await start(bucket, 'zzz.txt')
+
+		const all = await (await request('GET', `/${bucket}?uploads&delimiter=/`)).text()
+		expect(all).toContain('<CommonPrefixes><Prefix>many/</Prefix></CommonPrefixes>')
+		expect(uploadKeys(all)).toEqual(['zzz.txt'])
+		expect(all).toContain('<IsTruncated>false</IsTruncated>')
+
+		const page1 = await (await request('GET', `/${bucket}?uploads&delimiter=/&max-uploads=1`)).text()
+		expect(page1).toContain('<Prefix>many/</Prefix>')
+		expect(page1).toContain('<IsTruncated>true</IsTruncated>')
+		expect(page1).toContain('<NextKeyMarker>many/</NextKeyMarker>')
+
+		const page2 = await (await request('GET', `/${bucket}?uploads&delimiter=/&max-uploads=1&key-marker=${encodeURIComponent('many/')}`)).text()
+		expect(uploadKeys(page2)).toEqual(['zzz.txt'])
+		expect(page2).toContain('<IsTruncated>false</IsTruncated>')
+	})
+
+	test('UPLOAD_EXPIRY_DAYS defaults to 7, accepts 0, and rejects a negative or non-numeric value', () => {
+		const base = { ACCESS_KEY_ID: 'a', SECRET_ACCESS_KEY: 'b' }
+		expect(loadConfig(base).uploadExpiryDays).toBe(7)
+		expect(loadConfig({ ...base, UPLOAD_EXPIRY_DAYS: '0' }).uploadExpiryDays).toBe(0)
+		expect(loadConfig({ ...base, UPLOAD_EXPIRY_DAYS: '2.5' }).uploadExpiryDays).toBe(2.5)
+		expect(() => loadConfig({ ...base, UPLOAD_EXPIRY_DAYS: '-1' })).toThrow('UPLOAD_EXPIRY_DAYS')
+		expect(() => loadConfig({ ...base, UPLOAD_EXPIRY_DAYS: 'soon' })).toThrow('UPLOAD_EXPIRY_DAYS')
+	})
+
+	test('a backup leaves out the parts of uploads in progress', async () => {
+		const bucket = await newBucketForUpload()
+		const uploadId = await start(bucket, 'bk.txt')
+		await putPart(bucket, 'bk.txt', uploadId, 1, 'in progress')
+		expect(existsSync(join(config.uploadsDir, uploadId, '1'))).toBe(true)
+
+		const dest = mkdtempSync(join(tmpdir(), 's3-backup-'))
+		try {
+			backup(join(dest, 'copy'))
+			expect(existsSync(join(dest, 'copy', 'uploads'))).toBe(false)
+			expect(existsSync(join(dest, 'copy', 'buckets'))).toBe(true)
+		} finally {
+			rmSync(dest, { recursive: true, force: true })
 		}
 	})
 })
