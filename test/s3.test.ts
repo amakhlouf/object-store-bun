@@ -291,6 +291,19 @@ describe('buckets', () => {
 		expect(await list.text()).toContain(`<Name>${name}</Name>`)
 	})
 
+	test('bucket requests with a trailing slash reach the bucket handlers', async () => {
+		const name = newBucket()
+		expect((await request('PUT', `/${name}/`)).status).toBe(200)
+		expect((await request('HEAD', `/${name}/`)).status).toBe(200)
+
+		const list = await request('GET', `/${name}/`)
+		expect(list.status).toBe(200)
+		expect(await list.text()).toContain('<ListBucketResult')
+
+		expect((await request('DELETE', `/${name}/`)).status).toBe(204)
+		expect((await request('HEAD', `/${name}`)).status).toBe(404)
+	})
+
 	test('creating an existing bucket returns BucketAlreadyExists', async () => {
 		const name = newBucket()
 		await request('PUT', `/${name}`)

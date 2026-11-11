@@ -2,10 +2,14 @@ import type { BunRequest } from 'bun'
 import { config } from '../config'
 import { buckets, objects, type ObjectRow } from '../db'
 import { deleteObjectFile, objectPath, readObject, writeObject } from '../storage'
+import { createBucket, deleteBucket, headBucket } from './buckets'
 import { S3Error } from './errors'
 import { xmlResponse } from './responses'
 
+// Bucket requests can arrive with a trailing slash (PUT /bucket/), which the wildcard route catches with an empty key.
+// The signature still covers the path with the slash, so only the dispatch changes here.
 export async function putObject(req: BunRequest<'/:bucket/*'>): Promise<Response> {
+	if (!objectKey(req)) return createBucket(req)
 	if (req.headers.has('x-amz-copy-source')) return copyObject(req)
 
 	const bucket = req.params.bucket
@@ -80,11 +84,15 @@ export function getObject(req: BunRequest<'/:bucket/*'>): Response {
 }
 
 export function headObject(req: BunRequest<'/:bucket/*'>): Response {
+	if (!objectKey(req)) return headBucket(req)
+
 	const row = findObjectOrThrow(req.params.bucket, objectKey(req))
 	return new Response(null, { headers: objectHeaders(row) })
 }
 
 export async function deleteObject(req: BunRequest<'/:bucket/*'>): Promise<Response> {
+	if (!objectKey(req)) return deleteBucket(req)
+
 	const bucket = req.params.bucket
 	const key = objectKey(req)
 	assertBucketExists(bucket)
