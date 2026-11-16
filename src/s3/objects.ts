@@ -2,9 +2,12 @@ import type { BunRequest } from 'bun'
 import { config } from '../config'
 import { objects, type ObjectRow } from '../db'
 import { deleteObjectFile, objectPath, readObject, writeObject } from '../storage'
+import { getBucketPolicy, isPolicyRequest } from './bucket-policy'
 import { createBucket, deleteBucket, headBucket } from './buckets'
 import { assertBucketExists, findObjectOrThrow, objectKey, parseCopySource } from './lookup'
 import { abortMultipartUpload, hasUploadId, isPartUpload, listMultipartUploads, listParts, uploadPart } from './multipart'
+import { PUBLIC_CACHE_CONTROL } from './bucket-policy'
+import { isSignedRequest } from './auth'
 import { xmlResponse } from './responses'
 import { uploadBody } from './upload-body'
 
@@ -63,7 +66,7 @@ export function getObject(req: BunRequest<'/:bucket/*'>): Response | Promise<Res
 	const row = findObjectOrThrow(bucket, key)
 
 	return new Response(readObject(objectPath(config.bucketsDir, bucket, key)), {
-		headers: objectHeaders(row),
+		headers: readHeaders(req, row),
 	})
 }
 
@@ -71,7 +74,7 @@ export function headObject(req: BunRequest<'/:bucket/*'>): Response {
 	if (!objectKey(req)) return headBucket(req)
 
 	const row = findObjectOrThrow(req.params.bucket, objectKey(req))
-	return new Response(null, { headers: objectHeaders(row) })
+	return new Response(null, { headers: readHeaders(req, row) })
 }
 
 export async function deleteObject(req: BunRequest<'/:bucket/*'>): Promise<Response> {
@@ -89,6 +92,7 @@ export async function deleteObject(req: BunRequest<'/:bucket/*'>): Promise<Respo
 }
 
 export function listObjects(req: BunRequest<'/:bucket'>): Response {
+	if (isPolicyRequest(req)) return getBucketPolicy(req)
 	if (new URL(req.url).searchParams.has('uploads')) return listMultipartUploads(req)
 
 	const bucket = req.params.bucket
@@ -141,6 +145,13 @@ export function listObjects(req: BunRequest<'/:bucket'>): Response {
 			CommonPrefixes: [...commonPrefixes].map(p => ({ Prefix: p })),
 		},
 	})
+}
+
+// Anonymous reads (allowed by a bucket policy) are cacheable. Signed reads keep their headers as before.
+function readHeaders(req: Request, row: ObjectRow): Record<string, string> {
+	const headers = objectHeaders(row)
+	if (!isSignedRequest(req)) headers['Cache-Control'] = PUBLIC_CACHE_CONTROL
+	return headers
 }
 
 function objectHeaders(row: ObjectRow): Record<string, string> {

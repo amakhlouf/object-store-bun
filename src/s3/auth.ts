@@ -47,6 +47,12 @@ export function hasUnsignedHeaderPayload(req: Request): boolean {
 	return req.headers.get('x-amz-content-sha256') === 'UNSIGNED-PAYLOAD' && !new URL(req.url).searchParams.has('X-Amz-Signature')
 }
 
+// True when the request carries a signature, in the Authorization header or in a presigned URL.
+// A request with neither is anonymous: only a bucket policy can let it through.
+export function isSignedRequest(req: Request): boolean {
+	return req.headers.has('authorization') || new URL(req.url).searchParams.has('X-Amz-Signature')
+}
+
 export function checkAuth(req: Request): void {
 	const url = new URL(req.url)
 	if (url.searchParams.has('X-Amz-Signature')) {

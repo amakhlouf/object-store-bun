@@ -1470,3 +1470,233 @@ describe('list objects', () => {
 		expect(code(await res.text())).toBe('NoSuchBucket')
 	})
 })
+
+describe('public buckets', () => {
+	const policyFor = (bucket: string, overrides: Record<string, unknown> = {}) => JSON.stringify({
+		Version: '2012-10-17',
+		Statement: [{
+			Effect: 'Allow',
+			Principal: '*',
+			Action: 's3:GetObject',
+			Resource: `arn:aws:s3:::${bucket}/*`,
+			...overrides,
+		}],
+	})
+	const anon = (method: string, path: string, init: RequestInit = {}) =>
+		fetch(new URL(path, server.url), { ...init, method })
+
+	// A private bucket with one file, and a public one with the same file.
+	async function bucketWithFile(publicRead: boolean) {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		await request('PUT', `/${name}/a.txt`, { body: 'hello world', headers: { 'Content-Type': 'text/plain' } })
+		if (publicRead) {
+			const res = await request('PUT', `/${name}?policy`, { body: policyFor(name) })
+			expect(res.status).toBe(204)
+		}
+		return name
+	}
+
+	test('AC-1: anonymous GET on a private bucket returns AccessDenied', async () => {
+		const name = await bucketWithFile(false)
+		const res = await anon('GET', `/${name}/a.txt`)
+		expect(res.status).toBe(403)
+		expect(code(await res.text())).toBe('AccessDenied')
+	})
+
+	test('AC-2: anonymous GET on a public bucket returns the object, with its content type', async () => {
+		const name = await bucketWithFile(true)
+		const res = await anon('GET', `/${name}/a.txt`)
+		expect(res.status).toBe(200)
+		expect(res.headers.get('content-type')).toBe('text/plain')
+		expect(await res.text()).toBe('hello world')
+	})
+
+	test('AC-3: anonymous HEAD on a public bucket returns headers only', async () => {
+		const name = await bucketWithFile(true)
+		const res = await anon('HEAD', `/${name}/a.txt`)
+		expect(res.status).toBe(200)
+		expect(res.headers.get('content-length')).toBe('11')
+		expect(await res.text()).toBe('')
+	})
+
+	test('AC-4: anonymous Range read returns 206 with the requested bytes', async () => {
+		const name = await bucketWithFile(true)
+		const res = await anon('GET', `/${name}/a.txt`, { headers: { Range: 'bytes=0-4' } })
+		expect(res.status).toBe(206)
+		expect(await res.text()).toBe('hello')
+	})
+
+	test('AC-5: anonymous listing is refused even on a public bucket', async () => {
+		const name = await bucketWithFile(true)
+		const res = await anon('GET', `/${name}`)
+		expect(res.status).toBe(403)
+		expect(code(await res.text())).toBe('AccessDenied')
+	})
+
+	test('AC-6: anonymous PUT and DELETE are refused and change nothing', async () => {
+		const name = await bucketWithFile(true)
+		const put = await anon('PUT', `/${name}/b.txt`, { body: 'x' })
+		expect(put.status).toBe(403)
+		const del = await anon('DELETE', `/${name}/a.txt`)
+		expect(del.status).toBe(403)
+
+		const head = await request('HEAD', `/${name}/b.txt`)
+		expect(head.status).toBe(404)
+		const still = await request('GET', `/${name}/a.txt`)
+		expect(await still.text()).toBe('hello world')
+	})
+
+	test('AC-7: a signed PutBucketPolicy makes the bucket readable anonymously', async () => {
+		const name = await bucketWithFile(false)
+		expect((await anon('GET', `/${name}/a.txt`)).status).toBe(403)
+
+		const put = await request('PUT', `/${name}?policy`, { body: policyFor(name) })
+		expect(put.status).toBe(204)
+		expect((await anon('GET', `/${name}/a.txt`)).status).toBe(200)
+	})
+
+	test('AC-8: a policy that allows ListBucket is refused and not stored', async () => {
+		const name = await bucketWithFile(false)
+		const body = JSON.stringify({
+			Version: '2012-10-17',
+			Statement: [{ Effect: 'Allow', Principal: '*', Action: ['s3:GetObject', 's3:ListBucket'], Resource: `arn:aws:s3:::${name}/*` }],
+		})
+		const res = await request('PUT', `/${name}?policy`, { body })
+		expect(res.status).toBe(501)
+		expect(code(await res.text())).toBe('NotImplemented')
+		expect((await request('GET', `/${name}?policy`)).status).toBe(404)
+	})
+
+	test('AC-9: a policy with a Condition or a Deny is refused and not stored', async () => {
+		const name = await bucketWithFile(false)
+		const withCondition = policyFor(name, { Condition: { IpAddress: { 'aws:SourceIp': '10.0.0.0/8' } } })
+		const withDeny = policyFor(name, { Effect: 'Deny' })
+
+		for (const body of [withCondition, withDeny]) {
+			const res = await request('PUT', `/${name}?policy`, { body })
+			expect(res.status).toBe(501)
+			expect(code(await res.text())).toBe('NotImplemented')
+		}
+		expect((await request('GET', `/${name}?policy`)).status).toBe(404)
+	})
+
+	test('AC-10: a policy that is not valid JSON returns MalformedPolicy and is not stored', async () => {
+		const name = await bucketWithFile(false)
+		const res = await request('PUT', `/${name}?policy`, { body: '{not json' })
+		expect(res.status).toBe(400)
+		expect(code(await res.text())).toBe('MalformedPolicy')
+		expect((await request('GET', `/${name}?policy`)).status).toBe(404)
+	})
+
+	test('AC-11: an unsigned PutBucketPolicy returns 403', async () => {
+		const name = await bucketWithFile(false)
+		const res = await anon('PUT', `/${name}?policy`, { body: policyFor(name) })
+		expect(res.status).toBe(403)
+		expect((await anon('GET', `/${name}/a.txt`)).status).toBe(403)
+	})
+
+	test('AC-12: after DeleteBucketPolicy, anonymous reads are refused again', async () => {
+		const name = await bucketWithFile(true)
+		expect((await anon('GET', `/${name}/a.txt`)).status).toBe(200)
+
+		const del = await request('DELETE', `/${name}?policy`)
+		expect(del.status).toBe(204)
+		const res = await anon('GET', `/${name}/a.txt`)
+		expect(res.status).toBe(403)
+		expect(code(await res.text())).toBe('AccessDenied')
+	})
+
+	test('AC-13: a bad signature on a public bucket is refused, not treated as anonymous', async () => {
+		const name = await bucketWithFile(true)
+		const res = await request('GET', `/${name}/a.txt`, {}, { creds: { ...defaultCreds(), secretAccessKey: 'wrong' } })
+		expect(res.status).toBe(403)
+		expect(code(await res.text())).toBe('SignatureDoesNotMatch')
+	})
+
+	test('AC-14: an anonymous read of a missing bucket returns the same AccessDenied as a private bucket', async () => {
+		const res = await anon('GET', `/${newBucket()}/a.txt`)
+		expect(res.status).toBe(403)
+		expect(code(await res.text())).toBe('AccessDenied')
+	})
+
+	test('AC-15: GetBucketPolicy on a bucket with no policy returns NoSuchBucketPolicy', async () => {
+		const name = await bucketWithFile(false)
+		const res = await request('GET', `/${name}?policy`)
+		expect(res.status).toBe(404)
+		expect(code(await res.text())).toBe('NoSuchBucketPolicy')
+	})
+
+	test('GetBucketPolicy returns the stored policy as JSON', async () => {
+		const name = await bucketWithFile(true)
+		const res = await request('GET', `/${name}?policy`)
+		expect(res.status).toBe(200)
+		expect(res.headers.get('content-type')).toBe('application/json')
+		expect(JSON.parse(await res.text())).toEqual(JSON.parse(policyFor(name)))
+	})
+
+	test('a policy for another bucket is refused as malformed', async () => {
+		const name = await bucketWithFile(false)
+		const res = await request('PUT', `/${name}?policy`, { body: policyFor('some-other-bucket') })
+		expect(res.status).toBe(400)
+		expect(code(await res.text())).toBe('MalformedPolicy')
+	})
+
+	test('a policy for another principal is refused as not implemented', async () => {
+		const name = await bucketWithFile(false)
+		const res = await request('PUT', `/${name}?policy`, { body: policyFor(name, { Principal: { AWS: 'arn:aws:iam::123:root' } }) })
+		expect(res.status).toBe(501)
+	})
+
+	test('a policy over 20 KB is refused as malformed', async () => {
+		const name = await bucketWithFile(false)
+		const body = policyFor(name, { Sid: 'x'.repeat(21 * 1024) })
+		const res = await request('PUT', `/${name}?policy`, { body })
+		expect(res.status).toBe(400)
+		expect(code(await res.text())).toBe('MalformedPolicy')
+	})
+
+	test('a policy PUT to a missing bucket returns NoSuchBucket', async () => {
+		const name = newBucket()
+		const res = await request('PUT', `/${name}?policy`, { body: policyFor(name) })
+		expect(res.status).toBe(404)
+		expect(code(await res.text())).toBe('NoSuchBucket')
+	})
+
+	test('an anonymous read of a missing key in a public bucket returns NoSuchKey', async () => {
+		const name = await bucketWithFile(true)
+		const res = await anon('GET', `/${name}/missing.txt`)
+		expect(res.status).toBe(404)
+		expect(code(await res.text())).toBe('NoSuchKey')
+	})
+
+	test('anonymous reads carry Cache-Control; signed reads do not', async () => {
+		const name = await bucketWithFile(true)
+		const open = await anon('GET', `/${name}/a.txt`)
+		expect(open.headers.get('cache-control')).toBe('public, max-age=86400')
+
+		const signed = await request('GET', `/${name}/a.txt`)
+		expect(signed.headers.get('cache-control')).toBeNull()
+	})
+
+	test('an anonymous request with a subresource is not treated as a public read', async () => {
+		const name = await bucketWithFile(true)
+		const res = await anon('GET', `/${name}/a.txt?uploads`)
+		expect(res.status).toBe(403)
+	})
+
+	test('an expired presigned URL on a public bucket is refused, not treated as anonymous', async () => {
+		const name = await bucketWithFile(true)
+		const old = amzDateFor(new Date(Date.now() - 10 * 60 * 1000))
+		const res = await fetch(presignedUrl('GET', `/${name}/a.txt`, { expires: 60, amzDate: old }))
+		expect(res.status).toBe(403)
+		expect(code(await res.text())).toBe('AccessDenied')
+	})
+
+	test('a valid presigned URL still works on a private bucket', async () => {
+		const name = await bucketWithFile(false)
+		const res = await fetch(presignedUrl('GET', `/${name}/a.txt`))
+		expect(res.status).toBe(200)
+		expect(await res.text()).toBe('hello world')
+	})
+})

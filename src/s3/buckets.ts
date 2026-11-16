@@ -1,5 +1,6 @@
 import type { BunRequest } from 'bun'
 import { buckets } from '../db'
+import { deleteBucketPolicy, isPolicyRequest, putBucketPolicy } from './bucket-policy'
 import { S3Error } from './errors'
 import { xmlResponse } from './responses'
 
@@ -19,7 +20,9 @@ export function listBuckets(): Response {
 	})
 }
 
-export function createBucket(req: BunRequest<'/:bucket'>): Response {
+export function createBucket(req: BunRequest<'/:bucket'>): Response | Promise<Response> {
+	if (isPolicyRequest(req)) return putBucketPolicy(req)
+
 	const name = req.params.bucket
 	validateBucketName(name)
 	assertBucketNotExists(name)
@@ -34,6 +37,8 @@ export function headBucket(req: BunRequest<'/:bucket'>): Response {
 }
 
 export function deleteBucket(req: BunRequest<'/:bucket'>): Response {
+	if (isPolicyRequest(req)) return deleteBucketPolicy(req)
+
 	const name = req.params.bucket
 	assertBucketExists(name)
 	assertBucketEmpty(name)

@@ -1,7 +1,9 @@
+import type { BunRequest } from 'bun'
 import { config } from './config'
 import { health } from './health'
 import { log } from './log'
 import { checkAuth } from './s3/auth'
+import { isPublicRead } from './s3/bucket-policy'
 import { createBucket, deleteBucket, headBucket, listBuckets } from './s3/buckets'
 import { errorToResponse } from './s3/errors'
 import { postObject, startUploadSweeper } from './s3/multipart'
@@ -11,6 +13,15 @@ import { deleteObject, getObject, headObject, listObjects, putObject } from './s
 function authed<R extends Request>(handler: (req: R) => Response | Promise<Response>) {
 	return (req: R) => {
 		checkAuth(req)
+		return handler(req)
+	}
+}
+
+// Object reads (GET and HEAD) skip the signature only when the bucket's policy allows anonymous reads.
+// Every other request, and every signed one, is checked as usual.
+function objectReadAuthed(handler: (req: BunRequest<'/:bucket/*'>) => Response | Promise<Response>) {
+	return (req: BunRequest<'/:bucket/*'>) => {
+		if (!isPublicRead(req)) checkAuth(req)
 		return handler(req)
 	}
 }
@@ -48,8 +59,8 @@ export const server = Bun.serve({
 			DELETE: logged(authed(deleteBucket)),
 		},
 		'/:bucket/*': {
-			GET: logged(authed(getObject)),
-			HEAD: logged(authed(headObject)),
+			GET: logged(objectReadAuthed(getObject)),
+			HEAD: logged(objectReadAuthed(headObject)),
 			PUT: logged(authed(putObject)),
 			POST: logged(authed(postObject)),
 			DELETE: logged(authed(deleteObject)),

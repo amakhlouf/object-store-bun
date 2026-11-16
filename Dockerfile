@@ -17,7 +17,8 @@ RUN mkdir /data && chown bun:bun /data
 VOLUME /data
 
 USER bun
-EXPOSE 3000
+# Documents the port the server listens on. It follows PORT, which defaults to 3000 above and can be overridden at run time.
+EXPOSE $PORT
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
 	CMD bun -e "fetch('http://localhost:' + Bun.env.PORT + '/health').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"

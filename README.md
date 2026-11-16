@@ -96,7 +96,7 @@ Development and production can each have their own pair. A client must use the p
 KEEP_TEST_DATA=1 bun test
 ```
 
-The suite covers the S3 operations, signing and the upload body checks, multipart uploads, backups, and logging. On 2026-11-11 the server was also run locally and exercised with the real AWS SDK for .NET (AWSSDK.S3 4.0.104.12) and for JavaScript (3.1166): small and large uploads from buffers, streams, and files, multipart uploads including `UploadPartCopy`, `ListParts` and `ListMultipartUploads`, and aborts. That check is not part of `bun test`.
+The suite covers the S3 operations, signing and the upload body checks, multipart uploads, public buckets, backups, and logging. On 2026-11-11 the server was also run locally and exercised with the real AWS SDK for .NET (AWSSDK.S3 4.0.104.12) and for JavaScript (3.1166): small and large uploads from buffers, streams, and files, multipart uploads including `UploadPartCopy`, `ListParts` and `ListMultipartUploads`, and aborts. That check is not part of `bun test`.
 
 ## Logs
 
@@ -155,6 +155,7 @@ src/
     upload-body.ts  the body of an upload and its checks (signature, size, hash), shared by PutObject and UploadPart
     upload-lock.ts  a lock per multipart upload, so Complete, Abort, and expiry never run under a part being written
     buckets.ts      bucket handlers
+    bucket-policy.ts  bucket policies: the accepted subset, the policy calls, and the anonymous read check
     objects.ts      object handlers, including ListObjectsV2 and CopyObject
     multipart.ts    multipart upload handlers and the cleanup of abandoned uploads
     lookup.ts       helpers shared by the handlers (object key, bucket and object lookups, copy source)
@@ -202,17 +203,33 @@ The database is the index. Listings and existence checks read it. Object bytes a
 | AbortMultipartUpload    | `DELETE /:bucket/*?uploadId`           | Done   |
 | ListParts               | `GET /:bucket/*?uploadId`              | Done   |
 | ListMultipartUploads    | `GET /:bucket?uploads`                 | Done   |
+| PutBucketPolicy         | `PUT /:bucket?policy`                  | Done   |
+| GetBucketPolicy         | `GET /:bucket?policy`                  | Done   |
+| DeleteBucketPolicy      | `DELETE /:bucket?policy`               | Done   |
 
-Bucket requests with a trailing slash (`PUT /bucket/`, which AWS clients send) go to the bucket handlers too. Every route except `GET /health` requires a valid signature. Errors use the S3 XML error format, with codes such as `AccessDenied`, `SignatureDoesNotMatch`, `NoSuchBucket`, `NoSuchKey`, `BucketNotEmpty`, and `EntityTooLarge`.
+Bucket requests with a trailing slash (`PUT /bucket/`, which AWS clients send) go to the bucket handlers too. Every route except `GET /health` requires a valid signature, with one exception: an anonymous `GET` or `HEAD` of an object in a bucket with a public-read policy (see Limits). Errors use the S3 XML error format, with codes such as `AccessDenied`, `SignatureDoesNotMatch`, `NoSuchBucket`, `NoSuchKey`, `BucketNotEmpty`, and `EntityTooLarge`.
 
 ## Limits
 
 - **Presigned URLs:** supported. A link works until its `X-Amz-Expires` time, up to 7 days. Its signature covers `UNSIGNED-PAYLOAD`.
 - **Range requests:** supported. A `Range` header returns 206 with the requested bytes.
+- **Public buckets:** a bucket policy (`PutBucketPolicy`, `GetBucketPolicy`, `DeleteBucketPolicy`) can allow anonymous `s3:GetObject` for principal `*` on the bucket's objects. Only that shape is accepted: `Version` `2012-10-17`, `Effect` `Allow`, `Action` `s3:GetObject`, `Resource` `arn:aws:s3:::<bucket>/*`, no `Condition`, at most 20 KB. An anonymous `GET` or `HEAD` of an object reads it when the policy exists, and its response carries `Cache-Control: public, max-age=86400`. Signed requests are always checked, even on a public bucket. Anonymous listing, writes and multipart requests are refused with `AccessDenied`, as is any anonymous request to a private or missing bucket.
 - **Chunked uploads (`aws-chunked`):** supported in three forms: signed chunks (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`), signed chunks with a trailing checksum (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`, what the .NET SDK sends over HTTP), and unsigned chunks with a trailing checksum (`STREAMING-UNSIGNED-PAYLOAD-TRAILER`). Each chunk signature, the trailer signature, and the trailing checksum (`crc32`, `crc32c`, `sha1`, `sha256`) are checked, and a failure stores nothing. The size limit applies to `x-amz-decoded-content-length`. A `crc64nvme` checksum and the SigV4A streaming type return `NotImplemented`.
 - **Multipart uploads:** all the operations above work. As in S3, every part except the last must be at least 5 MiB (completing returns `EntityTooSmall` otherwise), and an upload can have up to 10,000 parts. That minimum does not depend on `MAX_FILE_BYTES`, so with a limit under 5 MiB only a single-part upload fits. `MAX_FILE_BYTES` applies to the finished object and to each part, so raise it for large files. Parts go through the same checks as any upload, and the parts list must be signed too. Parts are kept in `uploads/` until the upload is completed or aborted. An upload with no activity for `UPLOAD_EXPIRY_DAYS` (no part written in that time) is aborted, and a part folder that no upload owns (left by a crash) is removed after an hour. Parts of one upload can be written side by side. Complete, Abort, and the expiry wait for parts being written and then run alone, so a second Complete gets `NoSuchUpload`. A PUT with only one of `uploadId` and `partNumber` is rejected with `InvalidArgument`, and a page size of 0 gives an empty page. Backups leave `uploads/` out, so an upload in progress when a backup is restored cannot be completed. ListMultipartUploads orders by key, then start time.
 - **Payload hash:** a header-signed upload that sends a real SHA-256 hash in `x-amz-content-sha256` is checked against the body. A mismatch returns `XAmzContentSHA256Mismatch` and nothing is stored. A header-signed upload that signs `UNSIGNED-PAYLOAD` is rejected with `InvalidRequest`, so the body is always covered by the signature. Presigned URLs still use `UNSIGNED-PAYLOAD`, because the link is made before the body exists. Signed chunked uploads are protected by their chunk signatures. The unsigned-trailer form has only its checksum, which catches corruption but not tampering.
 - **Single owner:** one access key owns every bucket.
+
+## Differences from AWS S3
+
+This server follows the AWS S3 API, with the differences below. Keep this list up to date, because later changes will be planned against it.
+
+- **Bucket policies (spec `docs/specs/001-public-buckets.md`):** only `PutBucketPolicy`, `GetBucketPolicy` and `DeleteBucketPolicy` are supported. A policy may allow `s3:GetObject` for principal `*` on the bucket's own objects. Other actions, `Deny` statements, conditions and other principals return `NotImplemented`.
+- **Anonymous listing:** never allowed, even if a policy asks for it. AWS would allow it with `s3:ListBucket`.
+- **Canned ACLs:** `x-amz-acl` and `PutBucketAcl` are not supported. Object ACLs are not supported either.
+- **Block Public Access:** not implemented. Access is controlled only by signatures and the bucket policy.
+- **Missing bucket for anonymous requests:** returns `AccessDenied` (403), the same as a private bucket. This is done so bucket names can't be discovered.
+- **Access keys:** one key pair owns every bucket. No IAM users, roles, or temporary credentials.
+- **Virtual-host URLs:** not supported (path-style only, see Decisions).
 
 ## Before production
 

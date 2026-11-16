@@ -37,6 +37,12 @@ db.exec(`
   );
 `)
 
+// Databases made before bucket policies lack the policy column. Existing buckets get NULL, which means private.
+const bucketColumns = db.query<{ name: string }, []>('PRAGMA table_info(buckets)').all()
+if (!bucketColumns.some(column => column.name === 'policy')) {
+	db.exec('ALTER TABLE buckets ADD COLUMN policy TEXT')
+}
+
 export type UploadRow = { upload_id: string, bucket: string, key: string, content_type: string, created_at: string }
 export type PartRow = { upload_id: string, part_number: number, size: number, etag: string }
 
@@ -133,6 +139,18 @@ export const buckets = {
 			.query<{ n: number }, [string]>('SELECT COUNT(*) AS n FROM objects WHERE bucket = ?')
 			.get(name)
 		return row?.n ?? 0
+	},
+
+	// The normalized policy JSON, or null when the bucket is private (or does not exist).
+	getPolicy(name: string): string | null {
+		const row = db
+			.query<{ policy: string | null }, [string]>('SELECT policy FROM buckets WHERE name = ?')
+			.get(name)
+		return row?.policy ?? null
+	},
+
+	setPolicy(name: string, policy: string | null): void {
+		db.query('UPDATE buckets SET policy = ? WHERE name = ?').run(policy, name)
 	},
 }
 
