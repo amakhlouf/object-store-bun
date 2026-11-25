@@ -1821,6 +1821,18 @@ describe('list objects with a delimiter across pages', () => {
 	})
 })
 
+describe('deleting a bucket', () => {
+	test('is refused while a multipart upload is in progress', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		expect((await request('POST', `/${name}/k?uploads`)).status).toBe(200)
+
+		const res = await request('DELETE', `/${name}`)
+		expect(res.status).toBe(409)
+		expect(code(await res.text())).toBe('BucketNotEmpty')
+	})
+})
+
 describe('key lock', () => {
 	test('tasks on one key run one at a time, in order, while other keys run alongside', async () => {
 		const { withKeyLock } = await import('../src/s3/key-lock')

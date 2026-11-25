@@ -311,6 +311,7 @@ This server follows the AWS S3 API, with the differences below. Keep this list u
 - **Bucket policies (spec `docs/specs/001-public-buckets.md`):** only `PutBucketPolicy`, `GetBucketPolicy` and `DeleteBucketPolicy` are supported. A policy may allow `s3:GetObject` for principal `*` on the bucket's own objects. Other actions, `Deny` statements, conditions and other principals return `NotImplemented`.
 - **Anonymous listing:** never allowed, even if a policy asks for it. AWS would allow it with `s3:ListBucket`.
 - **Object keys:** a key is stored as a file path, so keys with an empty part (`a//b`, a leading or trailing slash), a `.` or `..` part, or a null character are refused with `InvalidArgument`. A key also can't be both an object and the folder of another key, such as `a` next to `a/b`. AWS allows all of these.
+- **Deleting a bucket:** refused with `BucketNotEmpty` while it has objects or multipart uploads in progress.
 - **Canned ACLs:** `x-amz-acl` and `PutBucketAcl` are not supported. Object ACLs are not supported either.
 - **Block Public Access:** not implemented. Access is controlled only by signatures and the bucket policy.
 - **Missing bucket for anonymous requests:** returns `AccessDenied` (403), the same as a private bucket. This is done so bucket names can't be discovered.

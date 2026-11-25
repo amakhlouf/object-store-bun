@@ -1,5 +1,5 @@
 import type { BunRequest } from 'bun'
-import { buckets } from '../db'
+import { buckets, uploads } from '../db'
 import { deleteBucketPolicy, isPolicyRequest, putBucketPolicy } from './bucket-policy'
 import { S3Error } from './errors'
 import { xmlResponse } from './responses'
@@ -68,7 +68,9 @@ function assertBucketExists(name: string): void {
 }
 
 function assertBucketEmpty(name: string): void {
-	const objectCount = buckets.countObjects(name)
+	// Uploads in progress count too: their rows and parts would be left behind, and a bucket created again under this
+	// name would show them.
+	const objectCount = buckets.countObjects(name) + uploads.countInBucket(name)
 	if (objectCount > 0) {
 		throw new S3Error('BucketNotEmpty', 409, 'The bucket you tried to delete is not empty.', `/${name}`)
 	}

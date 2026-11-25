@@ -102,6 +102,14 @@ export const uploads = {
 			.all(bucket, prefix, prefix, afterKey, ...sameKeyArgs, limit)
 	},
 
+	// Uploads in progress in a bucket.
+	countInBucket(bucket: string): number {
+		const row = db
+			.query<{ n: number }, [string]>('SELECT COUNT(*) AS n FROM multipart_uploads WHERE bucket = ?')
+			.get(bucket)
+		return row?.n ?? 0
+	},
+
 	// Uploads started before cutoff (an ISO time), for the expiry sweep.
 	startedBefore(cutoff: string): UploadRow[] {
 		return db.query<UploadRow, [string]>('SELECT * FROM multipart_uploads WHERE created_at < ?').all(cutoff)
