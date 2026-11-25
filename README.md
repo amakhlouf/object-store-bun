@@ -1,8 +1,8 @@
-# s3-storage-bun
+# object-store-bun
 
 An S3-compatible object storage server built with Bun. It stores buckets and objects on local disk, with metadata in SQLite.
 
-> **Status: early development.** Intended as a store for form attachments on a private Docker network, used only by a single backend service. Requests are authenticated with one access key pair from `.env`. It has been tested against the AWS SDKs for .NET and JavaScript.
+> **Status: early development.** Intended as a store for files on a private Docker network, used only by a single backend service. Requests are authenticated with one access key pair from `.env`. It has been tested against the AWS SDKs for .NET and JavaScript.
 
 ## Run
 
@@ -19,12 +19,74 @@ The server prints its address on startup, for example `S3 storage listening on h
 
 ## Deployment
 
-The setup is one container on a private Docker network, with the backend as its only client:
+The same code runs four ways. Only how it is started and how clients reach it differ.
 
-- The data folder is a named Docker volume, mounted at `/data`.
-- The access keys are read from `.env` by compose and passed in as environment variables. They are not copied into the image.
-- No ports are published to the host, so only containers on the `attachments` network can reach the server.
-- Docker polls `/health`, and the container is marked unhealthy if it stops responding.
+| | Native / dev | Docker image | Docker Compose | Dokploy |
+| --- | --- | --- | --- | --- |
+| Started with | `bun start` | `docker run` | `docker compose up` | An Application built from the `Dockerfile` |
+| Port | `PORT` (default 3000) | 3000 inside, fixed | 3000 inside, fixed | 3000 inside, fixed |
+| Reached from outside by | `localhost:PORT` | `-p 8080:3000` | `ports:` in `compose.yaml`, or other containers on the same network | A domain, or other apps on a shared network |
+| Data and backups | `DATA_DIR` and `BACKUP_DIR` | Mounts you pass at `/data` and `/backups` | Named volumes `storage-data` and `storage-backups` by default | Mounts you add in the UI. **Bind mounts recommended** |
+| Settings come from | `.env` | `-e` flags | `.env` and `compose.yaml` | The app's environment in the UI |
+
+In a container, the image fixes the port (3000) and the data and backup folders (`/data` and `/backups`). `PORT`, `DATA_DIR` and `BACKUP_DIR` are ignored there, even with `--env-file .env`. The image starts the server with `--port=3000` and sets `IN_CONTAINER=1`, which pins the two folders. Natively, those three settings work as described under Configuration.
+
+The container never contains the access keys. They are always passed in when it starts, and the server won't start without them.
+
+### Data and backups: use bind mounts
+
+> **Recommended for production and stage: bind mounts.** Mount real folders on the server at `/data` and `/backups`, and keep the backups folder on a different disk from the data.
+
+Why: the files are plain folders you can see, copy and snapshot with ordinary tools; they survive `docker compose down -v` and `docker volume prune`; and `/backups` can sit on another disk. A named volume always lives under Docker's own directory, on the same disk as everything else.
+
+Set the folders up once, before the first start:
+
+```bash
+sudo mkdir -p /srv/object-store/data /srv/object-store/backups
+sudo chown 1000:1000 /srv/object-store/data /srv/object-store/backups
+```
+
+The container runs as the `bun` user, which is UID 1000 in the image (checked with `docker run --rm --entrypoint id object-store-bun bun`). It can only write to folders it owns. Then mount them:
+
+| Deployment | How |
+| --- | --- |
+| `docker run` | `-v /srv/object-store/data:/data -v /srv/object-store/backups:/backups` |
+| Compose | Change the left side of the two volume lines in `compose.yaml` to those paths |
+| Dokploy | Mounts dialog, **Bind Mount**: Host Path `/srv/object-store/data`, Mount Path `/data`. Repeat for `/backups` |
+
+Things to know:
+- **Create the folders first.** On a Linux server, Docker creates a missing host folder owned by root, which the `bun` user can't write to. The server then exits at startup with a database error. Create the folders and set the owner yourself, as above.
+- **A read-only or wrong-owner folder fails the same way.** The container exits with code 1 and the error points at opening the database.
+- **Named volumes still work** and need no setup, so they stay the default in `compose.yaml` for local use. Use bind mounts for anything you want to keep.
+- On Dokploy, bind mounts only suit a single server. With several nodes, the path would have to exist on every node.
+
+### Native and dev
+
+```bash
+cp .env.example .env     # then fill in the keys
+bun install
+bun start                # or: bun dev
+```
+
+Change the port with `PORT` in `.env`, or for one run: `PORT=4000 bun src/index.ts`. Data goes to `./data` and backups to `./backups`, unless `DATA_DIR` and `BACKUP_DIR` say otherwise.
+
+### Docker image
+
+```bash
+docker build -t object-store-bun .
+docker run -d --name storage \
+  -e ACCESS_KEY_ID=... -e SECRET_ACCESS_KEY=... \
+  -v storage-data:/data -v storage-backups:/backups \
+  -p 8080:3000 \
+  object-store-bun
+```
+
+- Always mount both folders. The example uses named volumes, which need no setup. For production, use bind mounts as described above. Without any mount, the `VOLUME` lines in the Dockerfile create anonymous volumes, which are easy to lose track of.
+- Leave out `-p` to keep the server reachable only from other containers on the same Docker network.
+- `MAX_FILE_BYTES` and `INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS` are optional. Pass them with `-e`, or leave them out to use the defaults.
+- A plain `docker run` doesn't create a network. To let other containers reach it, create one with `docker network create` and start each container with `--network`.
+
+### Docker Compose
 
 ```bash
 docker compose up -d --build
@@ -32,19 +94,36 @@ docker compose ps        # shows the health status
 docker compose logs -f storage
 ```
 
-`compose.yaml` refuses to start unless `ACCESS_KEY_ID` and `SECRET_ACCESS_KEY` are set in `.env`. The Dockerfile sets `PORT`, `DATA_DIR` and `LOG_DIR`. `SQLITE_DB` and `MAX_FILE_BYTES` aren't set there, so the container uses their defaults from `src/config.ts`:
+- `compose.yaml` refuses to start unless `ACCESS_KEY_ID` and `SECRET_ACCESS_KEY` are set, in `.env` or the shell.
+- It mounts two named volumes: `storage-data` at `/data` and `storage-backups` at `/backups`.
+- It defines no network of its own, so other services in the same compose file reach it at `http://storage:3000` over the default network. Services in other compose projects need a shared external network.
+- No ports are published. To reach it from the host, add `ports: - "8080:3000"` to the `storage` service.
+- It passes the two keys, plus `MAX_FILE_BYTES` and `INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS` when they are set in `.env` or the shell. If they are unset, the app's defaults apply.
 
-| Setting | In the container |
-| ------- | ---------------- |
-| `PORT` | `3000` (Dockerfile) |
-| `DATA_DIR` | `/data` (the volume, Dockerfile) |
-| `SQLITE_DB` | `/data/storage.db` (default from `DATA_DIR`, `src/config.ts`) |
-| `MAX_FILE_BYTES` | `10485760` (10 MB, default in `src/config.ts`) |
-| `UPLOAD_EXPIRY_DAYS` | `7` (default in `src/config.ts`) |
+### Dokploy
 
-Your local `.env` may set `DATA_DIR=./data`. Compose doesn't pass that to the container, so the container still uses `/data`.
+Deploy it as an Application built from the `Dockerfile`. In that case `compose.yaml` is not used. These steps come from Dokploy's docs and UI, and haven't been tried on a real Dokploy server.
 
-The image was built and tested on 2026-11-01. The container became healthy, and a signed PUT, GET, and DELETE worked inside it. Logs go to `/data/logs/server.log` in the volume.
+1. **Environment:** set `ACCESS_KEY_ID` and `SECRET_ACCESS_KEY`. `MAX_FILE_BYTES` and `INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS` are optional.
+2. **Mounts (use bind mounts):** create the two folders on the server and set their owner, as described under Data and backups. Then add a **Bind Mount** with Host Path `/srv/object-store/data` and Mount Path `/data`, and another for `/backups`. Do this before the first deploy, so the data never sits in an anonymous volume. A Volume Mount (`storage-data` and `storage-backups`) also works, but it is not recommended for production.
+3. **Network:** attach one shared network to this app and to the apps that use it (Advanced, then Networks). The other apps reach it at `http://<app name>:3000`, where the app name is the one shown on its General tab.
+4. **Domain:** only if people outside the server need to read objects. Point it at container port 3000.
+5. **Replicas:** keep it at one. The database is a single SQLite file on one volume.
+
+The server only serves anonymous reads of objects in a bucket that has a public read policy. Everything else, including listings and writes, needs a signed request. A domain that has to be limited to a private network must be restricted outside this app.
+
+### Logs and backups in a container
+
+Logs go to stdout and to `/data/logs/server.log` in the data volume. To take a backup from a running container:
+
+```bash
+docker compose exec storage bun run backup     # Compose
+docker exec storage bun run backup             # docker run
+```
+
+See Backups for what is copied and how to get the files out of the volume.
+
+The image was built and run on 2026-11-25 with Docker Desktop. Checked: the server was healthy on port 3000 even with `PORT=5000` set; `DATA_DIR` and `BACKUP_DIR` were ignored; with bind mounts, `storage.db` and the logs landed in the data folder and `docker exec ... bun run backup` wrote a backup into the backups folder; and a read-only data folder made the container exit with code 1. Not checked: a signed upload and download in the built image, `docker compose up`, a Docker Engine on a Linux server, and Dokploy.
 
 ## Configuration
 
@@ -52,13 +131,11 @@ Set these in `.env` (Bun loads it automatically):
 
 | Variable          | Default               | Meaning                                              |
 | ----------------- | --------------------- | ---------------------------------------------------- |
-| `PORT`            | `3000`                | Port to listen on                                    |
+| `PORT`            | `3000`                | Port to listen on when run directly. A `--port=N` flag on the command line wins over it. In Docker the image passes `--port=3000`, so `PORT` has no effect there. |
 | `DATA_DIR`        | `./data`              | Folder for the database, logs, buckets (`buckets/`), and multipart parts (`uploads/`) |
-| `SQLITE_DB`       | blank (uses `DATA_DIR/storage.db`) | Optional path to the SQLite database. Leave blank to follow `DATA_DIR`. |
-| `MAX_FILE_BYTES`  | `10485760` (10 MB)    | Largest object accepted: a PutObject or CopyObject, or a completed multipart upload. Each part is limited to it too. |
-| `UPLOAD_EXPIRY_DAYS` | `7`                | Multipart uploads with no activity for this many days are aborted and their parts deleted. Activity is the start of the upload or the newest part written, whichever is later. `0` keeps them until they are completed or aborted. Checked at startup and every hour. |
-| `BACKUP_DIR`      | `./backups`           | Parent folder for backups. Each run writes a timestamped subfolder. Must be outside `DATA_DIR`; `bun run backup` refuses otherwise. In Docker, compose sets it to `/backups`, a host folder. |
-| `LOG_DIR`         | `DATA_DIR/logs`       | Folder for `server.log`. Blank uses the default.     |
+| `MAX_FILE_BYTES`  | `20971520` (20 MB)    | Largest object accepted: a PutObject or CopyObject, or a completed multipart upload. Each part is limited to it too. |
+| `INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS` | `7`                | Multipart uploads with no activity for this many days are aborted and their parts deleted. Activity is the start of the upload or the newest part written, whichever is later. `0` keeps them until they are completed or aborted. Checked at startup and every hour. |
+| `BACKUP_DIR`      | `./backups`           | Parent folder for backups. Each run writes a timestamped subfolder. Must be outside `DATA_DIR`; `bun run backup` refuses otherwise. In Docker the image pins it to `/backups`, a volume separate from the data, and ignores this setting. |
 | `ACCESS_KEY_ID`   | none (required)       | Public half of the access key pair, sent with requests |
 | `SECRET_ACCESS_KEY` | none (required)     | Secret half of the access key pair, never sent       |
 
@@ -109,7 +186,7 @@ Each request writes one line, and each error writes its stack trace:
 Lines go to two places:
 
 - **stdout:** what `docker compose logs` shows.
-- **`LOG_DIR/server.log`:** kept on disk, so logs survive outside Docker. The default folder is `DATA_DIR/logs`, so `./data/logs` locally.
+- **`DATA_DIR/logs/server.log`:** kept on disk, so logs survive outside Docker. Locally that's `./data/logs/server.log`.
 
 Query strings and headers are never logged, so signatures stay out of the log.
 
@@ -132,10 +209,16 @@ Backups are not scheduled, and there is no restore command yet. To restore, stop
 
 Keep backups on a different disk from the data. A backup in the same folder is lost with the data.
 
-In Docker, backups go to `./backups` on the host, through a bind mount in `compose.yaml`. Create that folder before `docker compose up`, and make sure the container's `bun` user can write to it. Run a backup with:
+In Docker, backups go to `/backups`, a named volume (`storage-backups`) separate from the data volume, so they survive losing the data volume but not the server. Run a backup with:
 
 ```bash
 docker compose exec storage bun run backup
+```
+
+To copy the backups out of the volume, for example to another machine:
+
+```bash
+docker compose cp storage:/backups ./backups-copy
 ```
 
 ## Layout
@@ -146,7 +229,7 @@ src/
   config.ts         reads .env into typed settings and default paths
   db.ts             SQLite schema and queries (buckets, objects, multipart uploads and parts)
   storage.ts        object files on disk (written to a temp file, then renamed)
-  log.ts            writes lines to stdout and LOG_DIR/server.log
+  log.ts            writes lines to stdout and DATA_DIR/logs/server.log
   health.ts         GET /health
   backup.ts         bun run backup
   s3/
@@ -215,7 +298,7 @@ Bucket requests with a trailing slash (`PUT /bucket/`, which AWS clients send) g
 - **Range requests:** supported. A `Range` header returns 206 with the requested bytes.
 - **Public buckets:** a bucket policy (`PutBucketPolicy`, `GetBucketPolicy`, `DeleteBucketPolicy`) can allow anonymous `s3:GetObject` for principal `*` on the bucket's objects. Only that shape is accepted: `Version` `2012-10-17`, `Effect` `Allow`, `Action` `s3:GetObject`, `Resource` `arn:aws:s3:::<bucket>/*`, no `Condition`, at most 20 KB. An anonymous `GET` or `HEAD` of an object reads it when the policy exists, and its response carries `Cache-Control: public, max-age=86400`. Signed requests are always checked, even on a public bucket. Anonymous listing, writes and multipart requests are refused with `AccessDenied`, as is any anonymous request to a private or missing bucket.
 - **Chunked uploads (`aws-chunked`):** supported in three forms: signed chunks (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`), signed chunks with a trailing checksum (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`, what the .NET SDK sends over HTTP), and unsigned chunks with a trailing checksum (`STREAMING-UNSIGNED-PAYLOAD-TRAILER`). Each chunk signature, the trailer signature, and the trailing checksum (`crc32`, `crc32c`, `sha1`, `sha256`) are checked, and a failure stores nothing. The size limit applies to `x-amz-decoded-content-length`. A `crc64nvme` checksum and the SigV4A streaming type return `NotImplemented`.
-- **Multipart uploads:** all the operations above work. As in S3, every part except the last must be at least 5 MiB (completing returns `EntityTooSmall` otherwise), and an upload can have up to 10,000 parts. That minimum does not depend on `MAX_FILE_BYTES`, so with a limit under 5 MiB only a single-part upload fits. `MAX_FILE_BYTES` applies to the finished object and to each part, so raise it for large files. Parts go through the same checks as any upload, and the parts list must be signed too. Parts are kept in `uploads/` until the upload is completed or aborted. An upload with no activity for `UPLOAD_EXPIRY_DAYS` (no part written in that time) is aborted, and a part folder that no upload owns (left by a crash) is removed after an hour. Parts of one upload can be written side by side. Complete, Abort, and the expiry wait for parts being written and then run alone, so a second Complete gets `NoSuchUpload`. A PUT with only one of `uploadId` and `partNumber` is rejected with `InvalidArgument`, and a page size of 0 gives an empty page. Backups leave `uploads/` out, so an upload in progress when a backup is restored cannot be completed. ListMultipartUploads orders by key, then start time.
+- **Multipart uploads:** all the operations above work. As in S3, every part except the last must be at least 5 MiB (completing returns `EntityTooSmall` otherwise), and an upload can have up to 10,000 parts. That minimum does not depend on `MAX_FILE_BYTES`, so with a limit under 5 MiB only a single-part upload fits. `MAX_FILE_BYTES` applies to the finished object and to each part, so raise it for large files. Parts go through the same checks as any upload, and the parts list must be signed too. Parts are kept in `uploads/` until the upload is completed or aborted. An upload with no activity for `INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS` (no part written in that time) is aborted, and a part folder that no upload owns (left by a crash) is removed after an hour. Parts of one upload can be written side by side. Complete, Abort, and the expiry wait for parts being written and then run alone, so a second Complete gets `NoSuchUpload`. A PUT with only one of `uploadId` and `partNumber` is rejected with `InvalidArgument`, and a page size of 0 gives an empty page. Backups leave `uploads/` out, so an upload in progress when a backup is restored cannot be completed. ListMultipartUploads orders by key, then start time.
 - **Payload hash:** a header-signed upload that sends a real SHA-256 hash in `x-amz-content-sha256` is checked against the body. A mismatch returns `XAmzContentSHA256Mismatch` and nothing is stored. A header-signed upload that signs `UNSIGNED-PAYLOAD` is rejected with `InvalidRequest`, so the body is always covered by the signature. Presigned URLs still use `UNSIGNED-PAYLOAD`, because the link is made before the body exists. Signed chunked uploads are protected by their chunk signatures. The unsigned-trailer form has only its checksum, which catches corruption but not tampering.
 - **Single owner:** one access key owns every bucket.
 
