@@ -1821,6 +1821,18 @@ describe('list objects with a delimiter across pages', () => {
 	})
 })
 
+describe('bucket policy payload hash', () => {
+	test('PutBucketPolicy accepts the payload hash in uppercase hex', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		const policy = JSON.stringify({ Version: '2012-10-17', Statement: [{ Effect: 'Allow', Principal: '*', Action: 's3:GetObject', Resource: `arn:aws:s3:::${name}/*` }] })
+		const hash = new Bun.CryptoHasher('sha256').update(policy).digest('hex').toUpperCase()
+
+		const res = await request('PUT', `/${name}?policy`, { body: policy }, { payloadHash: hash })
+		expect(res.status).toBe(204)
+	})
+})
+
 describe('deleting a bucket', () => {
 	test('is refused while a multipart upload is in progress', async () => {
 		const name = newBucket()

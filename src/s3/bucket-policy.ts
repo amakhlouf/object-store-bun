@@ -115,7 +115,7 @@ async function readPolicyText(req: Request, resource: string): Promise<string> {
 			chunks.push(chunk)
 		}
 	}
-	if (hasher && hasher.digest('hex') !== sha256) {
+	if (hasher && hasher.digest('hex') !== sha256?.toLowerCase()) {
 		throw new S3Error('XAmzContentSHA256Mismatch', 400, "The provided 'x-amz-content-sha256' header does not match what was computed.")
 	}
 	return new TextDecoder().decode(Buffer.concat(chunks))
