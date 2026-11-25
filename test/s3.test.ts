@@ -1821,6 +1821,38 @@ describe('list objects with a delimiter across pages', () => {
 	})
 })
 
+describe('key lock', () => {
+	test('tasks on one key run one at a time, in order, while other keys run alongside', async () => {
+		const { withKeyLock } = await import('../src/s3/key-lock')
+		const log: string[] = []
+		const gate = Promise.withResolvers<void>()
+
+		const first = withKeyLock('b', 'k', async () => {
+			log.push('first start')
+			await gate.promise
+			log.push('first end')
+		})
+		const second = withKeyLock('b', 'k', async () => {
+			log.push('second start')
+		})
+		await withKeyLock('b', 'other', async () => {
+			log.push('other')
+		})
+		await Bun.sleep(10)
+		expect(log).toEqual(['first start', 'other'])
+
+		gate.resolve()
+		await Promise.all([first, second])
+		expect(log).toEqual(['first start', 'other', 'first end', 'second start'])
+	})
+
+	test('a task that throws still releases the key', async () => {
+		const { withKeyLock } = await import('../src/s3/key-lock')
+		await expect(withKeyLock('b', 'boom', async () => { throw new Error('failed') })).rejects.toThrow('failed')
+		expect(await withKeyLock('b', 'boom', async () => 'ran')).toBe('ran')
+	})
+})
+
 describe('list objects over several read batches', () => {
 	const row = (bucket: string, key: string) => ({ bucket, key, size: 1, etag: 'e', content_type: 'text/plain', last_modified: new Date().toISOString() })
 

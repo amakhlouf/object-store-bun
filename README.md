@@ -237,6 +237,7 @@ src/
     chunked.ts      aws-chunked body decoder (chunk and trailer signatures, trailing checksums)
     upload-body.ts  the body of an upload and its checks (signature, size, hash), shared by PutObject and UploadPart
     upload-lock.ts  a lock per multipart upload, so Complete, Abort, and expiry never run under a part being written
+    key-lock.ts     a lock per object key, so a write and a delete of the same key never interleave
     buckets.ts      bucket handlers
     bucket-policy.ts  bucket policies: the accepted subset, the policy calls, and the anonymous read check
     objects.ts      object handlers, including ListObjectsV2 and CopyObject

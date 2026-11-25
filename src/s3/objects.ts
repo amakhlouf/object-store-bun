@@ -8,6 +8,7 @@ import { assertBucketExists, findObjectOrThrow, objectKey, parseCopySource } fro
 import { abortMultipartUpload, hasUploadId, isPartUpload, listMultipartUploads, listParts, uploadPart } from './multipart'
 import { PUBLIC_CACHE_CONTROL } from './bucket-policy'
 import { isSignedRequest } from './auth'
+import { withKeyLock } from './key-lock'
 import { xmlResponse } from './responses'
 import { uploadBody } from './upload-body'
 
@@ -28,14 +29,18 @@ export async function putObject(req: BunRequest<'/:bucket/*'>): Promise<Response
 	assertBucketExists(bucket)
 
 	const { body, sha256 } = uploadBody(req, `/${bucket}/${key}`)
-	const { etag, size } = await writeObject(objectPath(config.bucketsDir, bucket, key), body, sha256)
-	objects.upsert({
-		bucket,
-		key,
-		size,
-		etag,
-		content_type: req.headers.get('content-type') ?? 'application/octet-stream',
-		last_modified: new Date().toISOString(),
+	const path = objectPath(config.bucketsDir, bucket, key)
+	const { etag } = await withKeyLock(bucket, key, async () => {
+		const written = await writeObject(path, body, sha256)
+		objects.upsert({
+			bucket,
+			key,
+			size: written.size,
+			etag: written.etag,
+			content_type: req.headers.get('content-type') ?? 'application/octet-stream',
+			last_modified: new Date().toISOString(),
+		})
+		return written
 	})
 
 	return new Response(null, { status: 200, headers: { ETag: `"${etag}"` } })
@@ -51,12 +56,14 @@ async function copyObject(req: BunRequest<'/:bucket/*'>): Promise<Response> {
 	assertBucketExists(source.bucket)
 	const row = findObjectOrThrow(source.bucket, source.key)
 
-	const { etag, size } = await writeObject(
-		objectPath(config.bucketsDir, bucket, key),
-		readObject(objectPath(config.bucketsDir, source.bucket, source.key)).stream(),
-	)
-	const lastModified = new Date().toISOString()
-	objects.upsert({ bucket, key, size, etag, content_type: row.content_type, last_modified: lastModified })
+	const path = objectPath(config.bucketsDir, bucket, key)
+	const sourcePath = objectPath(config.bucketsDir, source.bucket, source.key)
+	const { etag, lastModified } = await withKeyLock(bucket, key, async () => {
+		const written = await writeObject(path, readObject(sourcePath).stream())
+		const modified = new Date().toISOString()
+		objects.upsert({ bucket, key, size: written.size, etag: written.etag, content_type: row.content_type, last_modified: modified })
+		return { etag: written.etag, lastModified: modified }
+	})
 
 	return xmlResponse({ CopyObjectResult: { LastModified: lastModified, ETag: `"${etag}"` } })
 }
@@ -92,8 +99,10 @@ export async function deleteObject(req: BunRequest<'/:bucket/*'>): Promise<Respo
 
 	// Checked first, so a key the server never stores can't make this delete another key's file.
 	const path = objectPath(config.bucketsDir, bucket, key)
-	objects.remove(bucket, key)
-	await deleteObjectFile(path)
+	await withKeyLock(bucket, key, async () => {
+		objects.remove(bucket, key)
+		await deleteObjectFile(path)
+	})
 
 	return new Response(null, { status: 204 })
 }

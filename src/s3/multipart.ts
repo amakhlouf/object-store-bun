@@ -7,6 +7,7 @@ import { log } from '../log'
 import { objectPath, readObject, writeObject } from '../storage'
 import { streamingContext } from './auth'
 import { S3Error } from './errors'
+import { withKeyLock } from './key-lock'
 import { assertBucketExists, findObjectOrThrow, objectKey, parseCopySource } from './lookup'
 import { xmlResponse } from './responses'
 import { assertSignedBody, signedPayloadHash, uploadBody } from './upload-body'
@@ -115,18 +116,20 @@ async function completeMultipartUpload(req: BunRequest<'/:bucket/*'>): Promise<R
 		}
 
 		// The parts are joined into a temp file and renamed into place, like any other write, so a failure keeps the old object.
-		const { size } = await writeObject(
-			objectPath(config.bucketsDir, upload.bucket, upload.key),
-			concatParts(chosen.map(part => partPath(upload, part.part_number))),
-		)
 		const etag = multipartEtag(chosen)
-		objects.upsert({
-			bucket: upload.bucket,
-			key: upload.key,
-			size,
-			etag,
-			content_type: upload.content_type,
-			last_modified: new Date().toISOString(),
+		await withKeyLock(upload.bucket, upload.key, async () => {
+			const { size } = await writeObject(
+				objectPath(config.bucketsDir, upload.bucket, upload.key),
+				concatParts(chosen.map(part => partPath(upload, part.part_number))),
+			)
+			objects.upsert({
+				bucket: upload.bucket,
+				key: upload.key,
+				size,
+				etag,
+				content_type: upload.content_type,
+				last_modified: new Date().toISOString(),
+			})
 		})
 		await discardUpload(upload)
 
