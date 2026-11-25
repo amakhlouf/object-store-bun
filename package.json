@@ -1,5 +1,5 @@
 {
-  "name": "s3-storage-bun",
+  "name": "object-store-bun",
   "module": "src/index.ts",
   "type": "module",
   "private": true,
