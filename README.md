@@ -228,7 +228,7 @@ src/
   index.ts          routes, auth wrapper, request logging, and server start
   config.ts         reads .env into typed settings and default paths
   db.ts             SQLite schema and queries (buckets, objects, multipart uploads and parts)
-  storage.ts        object files on disk (written to a temp file in tmp/, then renamed)
+  storage.ts        object files on disk (written to a temp file in tmp/, then renamed), and the rules for object keys
   log.ts            writes lines to stdout and DATA_DIR/logs/server.log
   health.ts         GET /health
   backup.ts         bun run backup
@@ -309,6 +309,7 @@ This server follows the AWS S3 API, with the differences below. Keep this list u
 
 - **Bucket policies (spec `docs/specs/001-public-buckets.md`):** only `PutBucketPolicy`, `GetBucketPolicy` and `DeleteBucketPolicy` are supported. A policy may allow `s3:GetObject` for principal `*` on the bucket's own objects. Other actions, `Deny` statements, conditions and other principals return `NotImplemented`.
 - **Anonymous listing:** never allowed, even if a policy asks for it. AWS would allow it with `s3:ListBucket`.
+- **Object keys:** a key is stored as a file path, so keys with an empty part (`a//b`, a leading or trailing slash), a `.` or `..` part, or a null character are refused with `InvalidArgument`. A key also can't be both an object and the folder of another key, such as `a` next to `a/b`. AWS allows all of these.
 - **Canned ACLs:** `x-amz-acl` and `PutBucketAcl` are not supported. Object ACLs are not supported either.
 - **Block Public Access:** not implemented. Access is controlled only by signatures and the bucket policy.
 - **Missing bucket for anonymous requests:** returns `AccessDenied` (403), the same as a private bucket. This is done so bucket names can't be discovered.

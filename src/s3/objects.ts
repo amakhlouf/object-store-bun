@@ -90,8 +90,10 @@ export async function deleteObject(req: BunRequest<'/:bucket/*'>): Promise<Respo
 	const key = objectKey(req)
 	assertBucketExists(bucket)
 
+	// Checked first, so a key the server never stores can't make this delete another key's file.
+	const path = objectPath(config.bucketsDir, bucket, key)
 	objects.remove(bucket, key)
-	await deleteObjectFile(objectPath(config.bucketsDir, bucket, key))
+	await deleteObjectFile(path)
 
 	return new Response(null, { status: 204 })
 }

@@ -518,7 +518,15 @@ describe('objects', () => {
 	})
 
 	test('keys that escape the bucket folder are rejected', () => {
-		expect(() => objectPath('/data', 'photos', '../secret')).toThrow('Invalid Argument')
+		for (const key of ['../secret', 'a/../../secret', '/etc/passwd']) {
+			let error: unknown
+			try {
+				objectPath('/data', 'photos', key)
+			} catch (caught) {
+				error = caught
+			}
+			expect(error).toMatchObject({ code: 'InvalidArgument', status: 400 })
+		}
 	})
 })
 
@@ -1729,6 +1737,41 @@ describe('public buckets', () => {
 		const res = await fetch(presignedUrl('GET', `/${name}/a.txt`))
 		expect(res.status).toBe(200)
 		expect(await res.text()).toBe('hello world')
+	})
+})
+
+describe('object keys', () => {
+	const putKey = (bucket: string, rawKey: string) => request('PUT', `/${bucket}/${rawKey}`, { body: 'x' })
+
+	test('a key that would land on another key\'s file is rejected, and nothing is stored', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		// %2F keeps the slash from being resolved by the URL parser, so the server sees the dot segments.
+		for (const rawKey of ['x%2F..%2Fy', 'a%2F.%2Fb', 'a%2F%2Fb', 'dir%2F', 'dir/']) {
+			const res = await putKey(name, rawKey)
+			expect(res.status).toBe(400)
+			expect(code(await res.text())).toBe('InvalidArgument')
+		}
+		expect(keys(await (await request('GET', `/${name}`)).text())).toEqual([])
+	})
+
+	test('a key can not be both an object and the folder of another key', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		expect((await putKey(name, 'a')).status).toBe(200)
+		const nested = await putKey(name, 'a/b')
+		expect(nested.status).toBe(400)
+		expect(code(await nested.text())).toBe('InvalidArgument')
+
+		expect((await putKey(name, 'c/d')).status).toBe(200)
+		const flat = await putKey(name, 'c')
+		expect(flat.status).toBe(400)
+		expect(code(await flat.text())).toBe('InvalidArgument')
+
+		// The objects that were already there are untouched.
+		expect(keys(await (await request('GET', `/${name}`)).text())).toEqual(['a', 'c/d'])
+		expect(await (await request('GET', `/${name}/a`)).text()).toBe('x')
+		expect(await (await request('GET', `/${name}/c/d`)).text()).toBe('x')
 	})
 })
 

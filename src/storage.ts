@@ -4,8 +4,17 @@ import { dirname, join, resolve, sep } from 'node:path'
 import { config } from './config'
 import { S3Error } from './s3/errors'
 
+// A key becomes a path inside the bucket folder, so two keys must never name the same file. Dot segments ("x/../y"),
+// empty segments ("a//b", a leading or trailing slash) all resolve onto another key's path, so they are refused.
+function assertPlainKey(key: string): void {
+	if (key.includes('\0') || key.split('/').some(part => part === '' || part === '.' || part === '..')) {
+		throw new S3Error('InvalidArgument', 400, 'Object keys can not have empty, "." or ".." parts, a leading or trailing slash, or a null character.')
+	}
+}
+
 // Buckets live in their own folder, so a bucket name can't collide with storage.db or logs/.
 export function objectPath(bucketsDir: string, bucket: string, key: string): string {
+	assertPlainKey(key)
 	const bucketRoot = resolve(bucketsDir, bucket)
 	const path = resolve(bucketRoot, key)
 	if (!path.startsWith(bucketRoot + sep) || path === bucketRoot) {
@@ -14,9 +23,23 @@ export function objectPath(bucketsDir: string, bucket: string, key: string): str
 	return path
 }
 
+// Keys are files, so "a" can't exist next to "a/b": one would have to be both a file and a folder.
+const FILE_FOLDER_CONFLICT = new Set(['EEXIST', 'ENOTDIR', 'EISDIR', 'ENOTEMPTY'])
+
+function asKeyConflict(error: unknown): S3Error | undefined {
+	const code = (error as { code?: string } | null)?.code
+	if (code && FILE_FOLDER_CONFLICT.has(code)) {
+		return new S3Error('InvalidArgument', 400, 'A key can not be both an object and the folder of another key, such as "a" next to "a/b".')
+	}
+}
+
 // expectedSha256 is the hash the client signed in x-amz-content-sha256. When given, the body must match it.
 export async function writeObject(path: string, body: AsyncIterable<Uint8Array> | null, expectedSha256?: string): Promise<{ etag: string, size: number }> {
-	await mkdir(dirname(path), { recursive: true })
+	try {
+		await mkdir(dirname(path), { recursive: true })
+	} catch (error) {
+		throw asKeyConflict(error) ?? error
+	}
 
 	// Write to a temp file first, so a failed upload never touches the object already at this path. The temp files live
 	// in their own folder, so no object key can ever look like one.
@@ -53,7 +76,12 @@ export async function writeObject(path: string, body: AsyncIterable<Uint8Array> 
 	}
 
 	// rename replaces the old file in one step, so readers see either the old object or the new one.
-	await rename(temp, path)
+	try {
+		await rename(temp, path)
+	} catch (error) {
+		await rm(temp, { force: true })
+		throw asKeyConflict(error) ?? error
+	}
 	return { etag: hasher.digest('hex'), size }
 }
 
