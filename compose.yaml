@@ -1,5 +1,6 @@
-# Runs the storage server on a private network. No ports are published to the host,
-# so only containers attached to the "attachments" network can reach it.
+# Runs the storage server. No ports are published to the host, so it is only reachable from containers on the
+# same Docker network. Put its clients on that network (the default project network, a shared network you attach
+# in Dokploy, or an external one). To reach it from the host, add a ports: line such as "8080:3000".
 services:
   storage:
     build: .
@@ -7,18 +8,14 @@ services:
     environment:
       ACCESS_KEY_ID: ${ACCESS_KEY_ID:?set ACCESS_KEY_ID in .env}
       SECRET_ACCESS_KEY: ${SECRET_ACCESS_KEY:?set SECRET_ACCESS_KEY in .env}
-      # Backups go to a folder on the host, outside the data volume, so they survive losing the volume.
-      BACKUP_DIR: /backups
+      # Optional. Empty means the app's default (20 MB and 7 days).
+      MAX_FILE_BYTES: ${MAX_FILE_BYTES:-}
+      INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS: ${INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS:-}
     volumes:
       - storage-data:/data
-      - ./backups:/backups
-    networks:
-      - attachments
-
-networks:
-  attachments:
-    # internal: true blocks traffic to the outside internet from this network.
-    internal: true
+      # A separate volume from the data, so backups survive losing the data volume (not the server).
+      - storage-backups:/backups
 
 volumes:
   storage-data:
+  storage-backups:
