@@ -266,7 +266,7 @@ describe('backup', () => {
 		await request('PUT', `/${name}`)
 		await request('PUT', `/${name}/a.txt`, { body: 'kept' })
 
-		const dest = mkdtempSync(join(tmpdir(), 's3-backup-'))
+		const dest = mkdtempSync(join(tmpdir(), 'object-store-backup-'))
 		try {
 			backup(join(dest, 'copy'))
 
@@ -1381,7 +1381,7 @@ describe('multipart upload', () => {
 		await putPart(bucket, 'bk.txt', uploadId, 1, 'in progress')
 		expect(existsSync(join(config.uploadsDir, uploadId, '1'))).toBe(true)
 
-		const dest = mkdtempSync(join(tmpdir(), 's3-backup-'))
+		const dest = mkdtempSync(join(tmpdir(), 'object-store-backup-'))
 		try {
 			backup(join(dest, 'copy'))
 			expect(existsSync(join(dest, 'copy', 'uploads'))).toBe(false)
@@ -1784,7 +1784,7 @@ describe('backup and object names', () => {
 		const halfWritten = join(config.tmpDir, 'half-written')
 		writeFileSync(halfWritten, 'partial')
 
-		const dest = mkdtempSync(join(tmpdir(), 's3-backup-'))
+		const dest = mkdtempSync(join(tmpdir(), 'object-store-backup-'))
 		try {
 			backup(join(dest, 'copy'))
 			expect(readFileSync(join(dest, 'copy', 'buckets', name, 'reports', '2024.tmp'), 'utf8')).toBe('report')
