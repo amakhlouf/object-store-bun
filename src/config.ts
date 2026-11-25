@@ -1,7 +1,7 @@
 import { join } from 'node:path'
 
 const DEFAULT_MAX_FILE_BYTES = 20 * 1024 * 1024
-const DEFAULT_UPLOAD_EXPIRY_DAYS = 7
+const DEFAULT_INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS = 7
 
 // Same order as .env.example: keys, server settings, then folders.
 export type Config = {
@@ -10,7 +10,7 @@ export type Config = {
 	port: number
 	maxFileBytes: number
 	// Multipart uploads older than this many days are aborted. 0 keeps them until they are completed or aborted.
-	uploadExpiryDays: number
+	incompleteUploadExpireAfterDays: number
 	dataDir: string
 	bucketsDir: string
 	uploadsDir: string
@@ -22,7 +22,7 @@ export type Config = {
 export function loadConfig(env: Record<string, string | undefined> = Bun.env): Config {
 	const port = Number(env.PORT || 3000)
 	const maxFileBytes = Number(env.MAX_FILE_BYTES || DEFAULT_MAX_FILE_BYTES)
-	const uploadExpiryDays = Number(env.UPLOAD_EXPIRY_DAYS || DEFAULT_UPLOAD_EXPIRY_DAYS)
+	const incompleteUploadExpireAfterDays = Number(env.INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS || DEFAULT_INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS)
 	const dataDir = env.DATA_DIR || './data'
 
 	if (!env.ACCESS_KEY_ID || !env.SECRET_ACCESS_KEY) {
@@ -34,8 +34,8 @@ export function loadConfig(env: Record<string, string | undefined> = Bun.env): C
 	if (!Number.isSafeInteger(maxFileBytes) || maxFileBytes <= 0) {
 		throw new Error(`MAX_FILE_BYTES must be a positive integer, got "${env.MAX_FILE_BYTES}"`)
 	}
-	if (!Number.isFinite(uploadExpiryDays) || uploadExpiryDays < 0) {
-		throw new Error(`UPLOAD_EXPIRY_DAYS must be zero or a positive number, got "${env.UPLOAD_EXPIRY_DAYS}"`)
+	if (!Number.isFinite(incompleteUploadExpireAfterDays) || incompleteUploadExpireAfterDays < 0) {
+		throw new Error(`INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS must be zero or a positive number, got "${env.INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS}"`)
 	}
 
 	return {
@@ -43,7 +43,7 @@ export function loadConfig(env: Record<string, string | undefined> = Bun.env): C
 		secretAccessKey: env.SECRET_ACCESS_KEY,
 		port,
 		maxFileBytes,
-		uploadExpiryDays,
+		incompleteUploadExpireAfterDays,
 		dataDir,
 		bucketsDir: join(dataDir, 'buckets'),
 		// Parts of unfinished multipart uploads. Not inside buckets/, so no bucket name can collide with it.

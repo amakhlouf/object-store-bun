@@ -1049,14 +1049,14 @@ describe('multipart upload', () => {
 		expect(code(await res.text())).toBe('NoSuchBucket')
 	})
 
-	test('uploads older than UPLOAD_EXPIRY_DAYS are aborted and their parts removed', async () => {
+	test('uploads older than INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS are aborted and their parts removed', async () => {
 		const bucket = await newBucketForUpload()
 		const old = {
 			upload_id: `expired${crypto.randomUUID().replaceAll('-', '')}`,
 			bucket,
 			key: 'old.txt',
 			content_type: 'text/plain',
-			created_at: new Date(Date.now() - (config.uploadExpiryDays + 1) * 24 * 60 * 60 * 1000).toISOString(),
+			created_at: new Date(Date.now() - (config.incompleteUploadExpireAfterDays + 1) * 24 * 60 * 60 * 1000).toISOString(),
 		}
 		uploads.create(old)
 		uploads.putPart({ upload_id: old.upload_id, part_number: 1, size: 1, etag: md5('x') })
@@ -1074,7 +1074,7 @@ describe('multipart upload', () => {
 		expect(uploads.get(fresh)).not.toBeNull()
 	})
 
-	test('with UPLOAD_EXPIRY_DAYS at 0, old uploads are kept', async () => {
+	test('with INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS at 0, old uploads are kept', async () => {
 		const bucket = await newBucketForUpload()
 		const old = {
 			upload_id: `keep${crypto.randomUUID().replaceAll('-', '')}`,
@@ -1084,13 +1084,13 @@ describe('multipart upload', () => {
 			created_at: new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString(),
 		}
 		uploads.create(old)
-		const days = config.uploadExpiryDays
-		config.uploadExpiryDays = 0
+		const days = config.incompleteUploadExpireAfterDays
+		config.incompleteUploadExpireAfterDays = 0
 		try {
 			await expireUploads()
 			expect(uploads.get(old.upload_id)).not.toBeNull()
 		} finally {
-			config.uploadExpiryDays = days
+			config.incompleteUploadExpireAfterDays = days
 			uploads.remove(old.upload_id)
 		}
 	})
@@ -1120,7 +1120,7 @@ describe('multipart upload', () => {
 			bucket,
 			key: 'busy.txt',
 			content_type: 'text/plain',
-			created_at: new Date(Date.now() - (config.uploadExpiryDays + 1) * 24 * 60 * 60 * 1000).toISOString(),
+			created_at: new Date(Date.now() - (config.incompleteUploadExpireAfterDays + 1) * 24 * 60 * 60 * 1000).toISOString(),
 		}
 		uploads.create(busy)
 		uploads.putPart({ upload_id: busy.upload_id, part_number: 1, size: 1, etag: md5('x') })
@@ -1326,13 +1326,13 @@ describe('multipart upload', () => {
 		expect(page2).toContain('<IsTruncated>false</IsTruncated>')
 	})
 
-	test('UPLOAD_EXPIRY_DAYS defaults to 7, accepts 0, and rejects a negative or non-numeric value', () => {
+	test('INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS defaults to 7, accepts 0, and rejects a negative or non-numeric value', () => {
 		const base = { ACCESS_KEY_ID: 'a', SECRET_ACCESS_KEY: 'b' }
-		expect(loadConfig(base).uploadExpiryDays).toBe(7)
-		expect(loadConfig({ ...base, UPLOAD_EXPIRY_DAYS: '0' }).uploadExpiryDays).toBe(0)
-		expect(loadConfig({ ...base, UPLOAD_EXPIRY_DAYS: '2.5' }).uploadExpiryDays).toBe(2.5)
-		expect(() => loadConfig({ ...base, UPLOAD_EXPIRY_DAYS: '-1' })).toThrow('UPLOAD_EXPIRY_DAYS')
-		expect(() => loadConfig({ ...base, UPLOAD_EXPIRY_DAYS: 'soon' })).toThrow('UPLOAD_EXPIRY_DAYS')
+		expect(loadConfig(base).incompleteUploadExpireAfterDays).toBe(7)
+		expect(loadConfig({ ...base, INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS: '0' }).incompleteUploadExpireAfterDays).toBe(0)
+		expect(loadConfig({ ...base, INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS: '2.5' }).incompleteUploadExpireAfterDays).toBe(2.5)
+		expect(() => loadConfig({ ...base, INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS: '-1' })).toThrow('INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS')
+		expect(() => loadConfig({ ...base, INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS: 'soon' })).toThrow('INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS')
 	})
 
 	test('a backup leaves out the parts of uploads in progress', async () => {

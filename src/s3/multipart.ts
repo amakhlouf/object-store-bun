@@ -418,13 +418,13 @@ async function lastActivity(upload: UploadRow): Promise<number> {
 	return latest
 }
 
-// Aborts uploads with no activity for UPLOAD_EXPIRY_DAYS, and removes part folders that no upload owns (left behind by a
+// Aborts uploads with no activity for INCOMPLETE_UPLOAD_EXPIRE_AFTER_DAYS, and removes part folders that no upload owns (left behind by a
 // crash). Each upload is locked while it is checked and removed. Returns how many were removed.
 export async function expireUploads(now = Date.now()): Promise<number> {
 	let removed = 0
 
-	if (config.uploadExpiryDays > 0) {
-		const cutoff = now - config.uploadExpiryDays * 24 * 60 * 60 * 1000
+	if (config.incompleteUploadExpireAfterDays > 0) {
+		const cutoff = now - config.incompleteUploadExpireAfterDays * 24 * 60 * 60 * 1000
 		for (const candidate of uploads.startedBefore(new Date(cutoff).toISOString())) {
 			const expired = await withUploadLock(candidate.upload_id, true, async () => {
 				// It may be gone already, or a part may have arrived while this waited for the lock.
