@@ -17,15 +17,15 @@ export function backup(destDir: string): void {
 	const dbPath = resolve(config.sqlitePath)
 	db.run('VACUUM INTO ?', [join(dest, basename(dbPath))])
 
-	// Skip the live database files, unfinished uploads (*.tmp), and the parts of multipart uploads in progress
-	// (uploads/). The snapshot above replaces the database.
-	const uploadsDir = resolve(config.uploadsDir)
+	// Skip the live database files, the files being written (tmp/), and the parts of multipart uploads in progress
+	// (uploads/). The snapshot above replaces the database. Object files are copied whatever their names are.
+	const skipped = [resolve(config.uploadsDir), resolve(config.tmpDir)]
 	cpSync(data, dest, {
 		recursive: true,
 		filter: src => {
 			const path = resolve(src)
-			if (path === uploadsDir || path.startsWith(uploadsDir + sep)) return false
-			return path !== dbPath && !path.startsWith(dbPath + '-') && !path.endsWith('.tmp')
+			if (skipped.some(dir => path === dir || path.startsWith(dir + sep))) return false
+			return path !== dbPath && !path.startsWith(dbPath + '-')
 		},
 	})
 }

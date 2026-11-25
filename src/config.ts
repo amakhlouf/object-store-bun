@@ -20,6 +20,8 @@ export type Config = {
 	dataDir: string
 	bucketsDir: string
 	uploadsDir: string
+	// Files being written. Every write goes here first and is renamed into place, so a backup can skip the whole folder.
+	tmpDir: string
 	logDir: string
 	backupDir: string
 	sqlitePath: string
@@ -65,6 +67,7 @@ export function loadConfig(env: Record<string, string | undefined> = Bun.env, ar
 		bucketsDir: join(dataDir, 'buckets'),
 		// Parts of unfinished multipart uploads. Not inside buckets/, so no bucket name can collide with it.
 		uploadsDir: join(dataDir, 'uploads'),
+		tmpDir: join(dataDir, 'tmp'),
 		logDir: join(dataDir, 'logs'),
 		// Outside DATA_DIR by default, so a backup is never copied into itself or kept on the same volume as the data.
 		backupDir: inContainer ? CONTAINER_BACKUP_DIR : env.BACKUP_DIR || './backups',

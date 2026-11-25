@@ -8,6 +8,7 @@ import { createBucket, deleteBucket, headBucket, listBuckets } from './s3/bucket
 import { errorToResponse } from './s3/errors'
 import { postObject, startUploadSweeper } from './s3/multipart'
 import { deleteObject, getObject, headObject, listObjects, putObject } from './s3/objects'
+import { clearTempFiles } from './storage'
 
 // Every routed handler checks the request signature before it runs.
 function authed<R extends Request>(handler: (req: R) => Response | Promise<Response>) {
@@ -42,6 +43,9 @@ function logged<R extends Request>(handler: (req: R) => Response | Promise<Respo
 		return res
 	}
 }
+
+// Files left in the temp folder by a crash. Nothing is writing yet, so they are all stale.
+await clearTempFiles()
 
 export const server = Bun.serve({
 	port: config.port,

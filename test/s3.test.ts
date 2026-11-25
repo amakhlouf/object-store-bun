@@ -1731,3 +1731,24 @@ describe('public buckets', () => {
 		expect(await res.text()).toBe('hello world')
 	})
 })
+
+describe('backup and object names', () => {
+	test('an object whose key ends in .tmp is backed up, and files being written are left out', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		await request('PUT', `/${name}/reports/2024.tmp`, { body: 'report' })
+		mkdirSync(config.tmpDir, { recursive: true })
+		const halfWritten = join(config.tmpDir, 'half-written')
+		writeFileSync(halfWritten, 'partial')
+
+		const dest = mkdtempSync(join(tmpdir(), 's3-backup-'))
+		try {
+			backup(join(dest, 'copy'))
+			expect(readFileSync(join(dest, 'copy', 'buckets', name, 'reports', '2024.tmp'), 'utf8')).toBe('report')
+			expect(existsSync(join(dest, 'copy', 'tmp'))).toBe(false)
+		} finally {
+			rmSync(dest, { recursive: true, force: true })
+			rmSync(halfWritten, { force: true })
+		}
+	})
+})

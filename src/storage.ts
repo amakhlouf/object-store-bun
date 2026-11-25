@@ -1,6 +1,6 @@
 import type { BunFile } from 'bun'
 import { mkdir, rename, rm } from 'node:fs/promises'
-import { dirname, resolve, sep } from 'node:path'
+import { dirname, join, resolve, sep } from 'node:path'
 import { config } from './config'
 import { S3Error } from './s3/errors'
 
@@ -18,8 +18,10 @@ export function objectPath(bucketsDir: string, bucket: string, key: string): str
 export async function writeObject(path: string, body: AsyncIterable<Uint8Array> | null, expectedSha256?: string): Promise<{ etag: string, size: number }> {
 	await mkdir(dirname(path), { recursive: true })
 
-	// Write to a temp file first, so a failed upload never touches the object already at this path.
-	const temp = `${path}.${crypto.randomUUID()}.tmp`
+	// Write to a temp file first, so a failed upload never touches the object already at this path. The temp files live
+	// in their own folder, so no object key can ever look like one.
+	await mkdir(config.tmpDir, { recursive: true })
+	const temp = join(config.tmpDir, `${crypto.randomUUID()}.tmp`)
 	const hasher = new Bun.CryptoHasher('md5')
 	const payloadHasher = expectedSha256 ? new Bun.CryptoHasher('sha256') : undefined
 	const writer = Bun.file(temp).writer()
@@ -42,7 +44,10 @@ export async function writeObject(path: string, body: AsyncIterable<Uint8Array> 
 		}
 		await writer.end()
 	} catch (error) {
-		await writer.end()
+		// Closing can fail too, for example on a full disk. That must not hide the real error or keep the temp file.
+		try {
+			await writer.end()
+		} catch {}
 		await rm(temp, { force: true })
 		throw error
 	}
@@ -50,6 +55,11 @@ export async function writeObject(path: string, body: AsyncIterable<Uint8Array> 
 	// rename replaces the old file in one step, so readers see either the old object or the new one.
 	await rename(temp, path)
 	return { etag: hasher.digest('hex'), size }
+}
+
+// Files left in the temp folder by a crash. Call it at start-up, before any request can be writing.
+export async function clearTempFiles(): Promise<void> {
+	await rm(config.tmpDir, { recursive: true, force: true })
 }
 
 export function readObject(path: string): BunFile {

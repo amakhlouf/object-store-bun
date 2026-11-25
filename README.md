@@ -201,7 +201,7 @@ bun run backup
 This writes a new folder, `./backups/<time>`, containing:
 
 - `storage.db`, a consistent snapshot of the database. It is taken through SQLite, so it is safe while the server runs.
-- The object files, copied from `DATA_DIR`. Unfinished uploads (`*.tmp`) and the parts of multipart uploads in progress (`uploads/`) are skipped.
+- The object files, copied from `DATA_DIR`. Files still being written (`tmp/`) and the parts of multipart uploads in progress (`uploads/`) are skipped. Objects are copied whatever their names are, including keys that end in `.tmp`.
 
 Set `BACKUP_DIR` to change the parent folder. Each run still writes a timestamped subfolder inside it. `backups/` is gitignored.
 
@@ -228,7 +228,7 @@ src/
   index.ts          routes, auth wrapper, request logging, and server start
   config.ts         reads .env into typed settings and default paths
   db.ts             SQLite schema and queries (buckets, objects, multipart uploads and parts)
-  storage.ts        object files on disk (written to a temp file, then renamed)
+  storage.ts        object files on disk (written to a temp file in tmp/, then renamed)
   log.ts            writes lines to stdout and DATA_DIR/logs/server.log
   health.ts         GET /health
   backup.ts         bun run backup
@@ -256,6 +256,7 @@ data/
   storage.db        SQLite index
   logs/server.log   request and error log
   uploads/          parts of multipart uploads in progress, one folder per upload
+  tmp/              files being written, before they are renamed into place (cleared at start-up)
   buckets/
     photos/         one folder per bucket, created on first object write
       2026/a.jpg    object key "2026/a.jpg"
