@@ -11,6 +11,11 @@ import { isSignedRequest } from './auth'
 import { xmlResponse } from './responses'
 import { uploadBody } from './upload-body'
 
+// How many rows one listing query reads.
+const LIST_BATCH_SIZE = 500
+// Sorts after every key that starts with a given prefix, so `key > prefix + AFTER_PREFIX` skips the whole prefix.
+const AFTER_PREFIX = '\u{10FFFF}'
+
 // Bucket requests can arrive with a trailing slash (PUT /bucket/), which the wildcard route catches with an empty key.
 // The signature still covers the path with the slash, so only the dispatch changes here.
 export async function putObject(req: BunRequest<'/:bucket/*'>): Promise<Response> {
@@ -104,32 +109,41 @@ export function listObjects(req: BunRequest<'/:bucket'>): Response {
 	const requested = Number(url.searchParams.get('max-keys') ?? 1000)
 	const maxKeys = Number.isInteger(requested) && requested >= 0 ? Math.min(requested, 1000) : 1000
 	const token = url.searchParams.get('continuation-token')
-	const after = token ? Buffer.from(token, 'base64url').toString() : ''
+	const resumeFrom = token ? Buffer.from(token, 'base64url').toString() : ''
+	// A token that ends with the delimiter names a common prefix, the last entry of the previous page. Continue after
+	// everything under it, so the prefix is not listed again.
+	const resumedAfterPrefix = delimiter !== '' && resumeFrom.endsWith(delimiter) && resumeFrom.startsWith(prefix)
 
-	const rows = objects.list(bucket, prefix, after, maxKeys + 1)
-	const page = rows.slice(0, maxKeys)
-	// max-keys=0 is an empty page, not a truncated one: there would be no key to use as the continuation token.
-	const truncated = maxKeys > 0 && rows.length > maxKeys
-
-	const contents: object[] = []
-	const commonPrefixes = new Set<string>()
-	for (const row of page) {
-		const rest = row.key.slice(prefix.length)
-		const cut = delimiter ? rest.indexOf(delimiter) : -1
-		if (cut >= 0) {
-			commonPrefixes.add(prefix + rest.slice(0, cut + delimiter.length))
-		} else {
-			contents.push({
-				Key: row.key,
-				LastModified: row.last_modified,
-				ETag: `"${row.etag}"`,
-				Size: row.size,
-				StorageClass: 'STANDARD',
-			})
+	// Entries are keys and common prefixes, and max-keys counts both. Rows are read in batches until the page is full, and a
+	// whole common prefix is skipped in one step, so a prefix with many keys costs one extra query, not one per key.
+	const contents: ObjectRow[] = []
+	const commonPrefixes: string[] = []
+	let cursor = resumedAfterPrefix ? resumeFrom + AFTER_PREFIX : resumeFrom
+	let lastEntry = ''
+	let truncated = false
+	// max-keys=0 is an empty page, not a truncated one: there would be no entry to use as the continuation token.
+	scan: while (maxKeys > 0) {
+		const rows = objects.list(bucket, prefix, cursor, LIST_BATCH_SIZE)
+		for (const row of rows) {
+			if (contents.length + commonPrefixes.length === maxKeys) {
+				truncated = true
+				break scan
+			}
+			const rest = row.key.slice(prefix.length)
+			const cut = delimiter ? rest.indexOf(delimiter) : -1
+			if (cut >= 0) {
+				lastEntry = prefix + rest.slice(0, cut + delimiter.length)
+				commonPrefixes.push(lastEntry)
+				cursor = lastEntry + AFTER_PREFIX
+				continue scan
+			}
+			contents.push(row)
+			lastEntry = row.key
+			cursor = row.key
 		}
+		if (rows.length < LIST_BATCH_SIZE) break
 	}
 
-	const last = page.at(-1)?.key
 	return xmlResponse({
 		ListBucketResult: {
 			'@xmlns': 'http://s3.amazonaws.com/doc/2006-03-01/',
@@ -137,12 +151,18 @@ export function listObjects(req: BunRequest<'/:bucket'>): Response {
 			Prefix: prefix,
 			Delimiter: delimiter || undefined,
 			MaxKeys: maxKeys,
-			KeyCount: contents.length + commonPrefixes.size,
+			KeyCount: contents.length + commonPrefixes.length,
 			IsTruncated: truncated,
 			ContinuationToken: token || undefined,
-			NextContinuationToken: truncated && last ? Buffer.from(last).toString('base64url') : undefined,
-			Contents: contents,
-			CommonPrefixes: [...commonPrefixes].map(p => ({ Prefix: p })),
+			NextContinuationToken: truncated ? Buffer.from(lastEntry).toString('base64url') : undefined,
+			Contents: contents.map(row => ({
+				Key: row.key,
+				LastModified: row.last_modified,
+				ETag: `"${row.etag}"`,
+				Size: row.size,
+				StorageClass: 'STANDARD',
+			})),
+			CommonPrefixes: commonPrefixes.map(p => ({ Prefix: p })),
 		},
 	})
 }

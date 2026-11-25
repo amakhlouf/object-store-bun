@@ -5,7 +5,7 @@ import { basename, join, resolve, sep } from 'node:path'
 import { Database } from 'bun:sqlite'
 import { backup } from '../src/backup'
 import { config, loadConfig } from '../src/config'
-import { uploads } from '../src/db'
+import { objects, uploads } from '../src/db'
 import { server } from '../src/index'
 import { signatureFor } from '../src/s3/auth'
 import { checksumFor } from '../src/s3/chunked'
@@ -1750,5 +1750,56 @@ describe('backup and object names', () => {
 			rmSync(dest, { recursive: true, force: true })
 			rmSync(halfWritten, { force: true })
 		}
+	})
+})
+
+describe('list objects with a delimiter across pages', () => {
+	test('a common prefix is listed once, and a page never holds more than max-keys entries', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		for (const key of ['a/1', 'a/2', 'a/3', 'b', 'c/1']) await request('PUT', `/${name}/${key}`, { body: 'x' })
+
+		for (const size of [1, 2, 3]) {
+			const entries: string[] = []
+			let token: string | undefined
+			do {
+				const qs = new URLSearchParams({ delimiter: '/', 'max-keys': String(size) })
+				if (token) qs.set('continuation-token', token)
+				const xml = await (await request('GET', `/${name}?${qs}`)).text()
+				const prefixes = [...xml.matchAll(/<CommonPrefixes><Prefix>(.*?)<\/Prefix>/g)].map(m => m[1]!)
+				const count = Number(xml.match(/<KeyCount>(\d+)<\/KeyCount>/)![1])
+				expect(count).toBeLessThanOrEqual(size)
+				expect(count).toBe(keys(xml).length + prefixes.length)
+				entries.push(...keys(xml), ...prefixes)
+				token = xml.match(/<NextContinuationToken>(.*?)<\/NextContinuationToken>/)?.[1]
+			} while (token)
+			expect(entries.sort()).toEqual(['a/', 'b', 'c/'])
+		}
+	})
+})
+
+describe('list objects over several read batches', () => {
+	const row = (bucket: string, key: string) => ({ bucket, key, size: 1, etag: 'e', content_type: 'text/plain', last_modified: new Date().toISOString() })
+
+	test('a prefix larger than one batch is skipped whole, and a plain page can span batches', async () => {
+		const name = newBucket()
+		await request('PUT', `/${name}`)
+		// Rows go straight into the database: only the listing is under test, so no files are needed.
+		for (let i = 0; i < 1200; i++) objects.upsert(row(name, `big/${String(i).padStart(5, '0')}`))
+		objects.upsert(row(name, 'z'))
+
+		const first = await (await request('GET', `/${name}?delimiter=/&max-keys=1`)).text()
+		expect(first).toContain('<CommonPrefixes><Prefix>big/</Prefix></CommonPrefixes>')
+		expect(keys(first)).toEqual([])
+		const token = first.match(/<NextContinuationToken>(.*?)<\/NextContinuationToken>/)![1]
+		const second = await (await request('GET', `/${name}?delimiter=/&max-keys=1&continuation-token=${token}`)).text()
+		expect(keys(second)).toEqual(['z'])
+		expect(second).not.toContain('<CommonPrefixes>')
+		expect(second).toContain('<IsTruncated>false</IsTruncated>')
+
+		const page = await (await request('GET', `/${name}?max-keys=1000`)).text()
+		expect(keys(page)).toHaveLength(1000)
+		expect(keys(page)[999]).toBe('big/00999')
+		expect(page).toContain('<IsTruncated>true</IsTruncated>')
 	})
 })
