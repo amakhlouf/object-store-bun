@@ -76,4 +76,4 @@ export const server = Bun.serve({
 
 startUploadSweeper()
 
-console.log(`S3 storage listening on ${server.url}`)
+console.log(`object store listening on ${server.url}`)

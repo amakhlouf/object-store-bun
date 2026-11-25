@@ -13,7 +13,7 @@ bun check        # typecheck
 bun test         # test suite
 ```
 
-The server prints its address on startup, for example `S3 storage listening on http://localhost:3000/`.
+The server prints its address on startup, for example `object store listening on http://localhost:3000/`.
 
 `GET /health` answers without a signature. It returns `{"status":"ok"}` when the database responds, and 503 otherwise.
 
