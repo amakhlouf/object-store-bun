@@ -1,6 +1,6 @@
 import { join } from 'node:path'
 
-const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024
+const DEFAULT_MAX_FILE_BYTES = 20 * 1024 * 1024
 const DEFAULT_UPLOAD_EXPIRY_DAYS = 7
 
 // Same order as .env.example: keys, server settings, then folders.
