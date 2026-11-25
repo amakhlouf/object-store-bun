@@ -10,6 +10,8 @@ export function signedPayloadHash(req: Request): string | undefined {
 }
 
 // Over plain HTTP nothing else protects a body, so it must be covered by the signature: a real SHA-256 or aws-chunked.
+// The unsigned-trailer form of aws-chunked is accepted too. It has only a checksum, which catches corruption but not
+// tampering (see the README).
 export function assertSignedBody(req: Request): void {
 	if (hasUnsignedHeaderPayload(req)) {
 		throw new S3Error('InvalidRequest', 400, 'Uploads must sign the body: send its SHA-256 in x-amz-content-sha256, or use aws-chunked streaming. UNSIGNED-PAYLOAD is only accepted on presigned URLs.')
