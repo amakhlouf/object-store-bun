@@ -150,6 +150,25 @@ describe('auth', () => {
 	})
 })
 
+describe('port', () => {
+	const env = { ACCESS_KEY_ID: 'a', SECRET_ACCESS_KEY: 'b' }
+
+	test('defaults to 3000, and PORT overrides it', () => {
+		expect(loadConfig(env, []).port).toBe(3000)
+		expect(loadConfig({ ...env, PORT: '5000' }, []).port).toBe(5000)
+	})
+
+	test('--port wins over PORT, in both forms', () => {
+		expect(loadConfig({ ...env, PORT: '5000' }, ['--port=3000']).port).toBe(3000)
+		expect(loadConfig({ ...env, PORT: '5000' }, ['--port', '3000']).port).toBe(3000)
+	})
+
+	test('rejects a bad port from either source', () => {
+		expect(() => loadConfig({ ...env, PORT: 'abc' }, [])).toThrow('PORT')
+		expect(() => loadConfig(env, ['--port=-1'])).toThrow('PORT')
+	})
+})
+
 describe('path defaults', () => {
 	test('everything except backups defaults to a folder under DATA_DIR', () => {
 		const c = loadConfig({ DATA_DIR: '/srv/store', ACCESS_KEY_ID: 'a', SECRET_ACCESS_KEY: 'b' })
@@ -157,6 +176,19 @@ describe('path defaults', () => {
 		expect(c.logDir).toBe('/srv/store/logs')
 		expect(c.bucketsDir).toBe('/srv/store/buckets')
 		expect(c.backupDir).toBe('./backups')
+	})
+
+	test('in a container the data and backup folders are fixed, whatever DATA_DIR and BACKUP_DIR say', () => {
+		const keys = { ACCESS_KEY_ID: 'a', SECRET_ACCESS_KEY: 'b' }
+		const fixed = loadConfig({ ...keys, IN_CONTAINER: '1', DATA_DIR: './data', BACKUP_DIR: './backup' })
+		expect(fixed.dataDir).toBe('/data')
+		expect(fixed.bucketsDir).toBe('/data/buckets')
+		expect(fixed.sqlitePath).toBe('/data/storage.db')
+		expect(fixed.logDir).toBe('/data/logs')
+		expect(fixed.backupDir).toBe('/backups')
+		expect(loadConfig({ ...keys, IN_CONTAINER: '1' }).dataDir).toBe('/data')
+		// Without the marker, both are read from the environment as before.
+		expect(loadConfig({ ...keys, DATA_DIR: './data', BACKUP_DIR: './backup' }).backupDir).toBe('./backup')
 	})
 
 	test('BACKUP_DIR overrides its default', () => {
