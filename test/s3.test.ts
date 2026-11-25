@@ -159,9 +159,8 @@ describe('path defaults', () => {
 		expect(c.backupDir).toBe('./backups')
 	})
 
-	test('LOG_DIR and BACKUP_DIR override their defaults', () => {
-		const c = loadConfig({ DATA_DIR: '/srv/store', LOG_DIR: '/var/log/s3', BACKUP_DIR: '/mnt/b', ACCESS_KEY_ID: 'a', SECRET_ACCESS_KEY: 'b' })
-		expect(c.logDir).toBe('/var/log/s3')
+	test('BACKUP_DIR overrides its default', () => {
+		const c = loadConfig({ DATA_DIR: '/srv/store', BACKUP_DIR: '/mnt/b', ACCESS_KEY_ID: 'a', SECRET_ACCESS_KEY: 'b' })
 		expect(c.backupDir).toBe('/mnt/b')
 	})
 })
@@ -261,7 +260,7 @@ describe('logging', () => {
 		expect(lines).toContainEqual(expect.stringMatching(/^GET \/health 200 \d+(\.\d+)?ms$/))
 	})
 
-	test('each request line is also appended to LOG_DIR/server.log', async () => {
+	test('each request line is also appended to DATA_DIR/logs/server.log', async () => {
 		await fetch(new URL('/health?marker=file', server.url))
 		const written = readFileSync(join(config.logDir, 'server.log'), 'utf8')
 		expect(written).toMatch(/GET \/health 200 \d+(\.\d+)?ms\n$/)

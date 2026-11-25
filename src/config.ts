@@ -48,10 +48,10 @@ export function loadConfig(env: Record<string, string | undefined> = Bun.env): C
 		bucketsDir: join(dataDir, 'buckets'),
 		// Parts of unfinished multipart uploads. Not inside buckets/, so no bucket name can collide with it.
 		uploadsDir: join(dataDir, 'uploads'),
-		logDir: env.LOG_DIR || join(dataDir, 'logs'),
+		logDir: join(dataDir, 'logs'),
 		// Outside DATA_DIR by default, so a backup is never copied into itself or kept on the same volume as the data.
 		backupDir: env.BACKUP_DIR || './backups',
-		sqlitePath: env.SQLITE_DB || join(dataDir, 'storage.db'),
+		sqlitePath: join(dataDir, 'storage.db'),
 	}
 }
 
